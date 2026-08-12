@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Paths the update APK may be served from. expo-file-system's Paths.cache maps
+     to the app's internal cacheDir; the others are safety nets. -->
+<paths>
+  <cache-path name="chaka_cache" path="." />
+  <files-path name="chaka_files" path="." />
+  <external-cache-path name="chaka_ext_cache" path="." />
+  <external-files-path name="chaka_ext_files" path="." />
+</paths>

@@ -1,25 +1,119 @@
 {
   "expo": {
-    "name": "my-personal-ai",
-    "slug": "my-personal-ai",
-    "version": "1.0.0",
+    "name": "Chaka-Myth",
+    "slug": "chaka-myth",
+    "version": "2.2.1",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
-    "userInterfaceStyle": "light",
+    "userInterfaceStyle": "dark",
+    "backgroundColor": "#0A0806",
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "bundleIdentifier": "com.chakamyth.app",
+      "infoPlist": {
+        "NSMicrophoneUsageDescription": "Chaka listens for your voice commands.",
+        "NSSpeechRecognitionUsageDescription": "Chaka transcribes your speech into commands.",
+        "NSContactsUsageDescription": "Chaka looks up contacts when you ask it to message or call someone.",
+        "NSCameraUsageDescription": "Chaka uses the camera for the flashlight and camera actions.",
+        "NSPhotoLibraryUsageDescription": "Chaka searches your photos and videos when you ask.",
+        "NSLocationWhenInUseUsageDescription": "Chaka uses your location for weather and nearby answers."
+      }
     },
     "android": {
+      "package": "com.chakamyth.app",
       "adaptiveIcon": {
-        "backgroundColor": "#E6F4FE",
+        "backgroundColor": "#0A0806",
         "foregroundImage": "./assets/android-icon-foreground.png",
         "backgroundImage": "./assets/android-icon-background.png",
         "monochromeImage": "./assets/android-icon-monochrome.png"
       },
+      "permissions": [
+        "android.permission.RECORD_AUDIO",
+        "android.permission.READ_CONTACTS",
+        "android.permission.CAMERA",
+        "android.permission.READ_MEDIA_IMAGES",
+        "android.permission.READ_MEDIA_VIDEO",
+        "android.permission.READ_MEDIA_AUDIO",
+        "android.permission.ACCESS_COARSE_LOCATION",
+        "android.permission.ACCESS_FINE_LOCATION",
+        "android.permission.POST_NOTIFICATIONS",
+        "android.permission.WRITE_SETTINGS",
+        "android.permission.SCHEDULE_EXACT_ALARM",
+        "android.permission.READ_EXTERNAL_STORAGE",
+        "android.permission.WRITE_EXTERNAL_STORAGE",
+        "android.permission.READ_MEDIA_VISUAL_USER_SELECTED",
+        "android.permission.WRITE_CONTACTS",
+        "android.permission.CALL_PHONE",
+        "com.android.alarm.permission.SET_ALARM",
+        "android.permission.REQUEST_DELETE_PACKAGES",
+        "android.permission.READ_CALENDAR",
+        "android.permission.WRITE_CALENDAR",
+        "android.permission.FOREGROUND_SERVICE",
+        "android.permission.FOREGROUND_SERVICE_DATA_SYNC",
+        "android.permission.SYSTEM_ALERT_WINDOW",
+        "android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"
+      ],
       "predictiveBackGestureEnabled": false
     },
     "web": {
       "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      "expo-secure-store",
+      [
+        "expo-speech-recognition",
+        {
+          "microphonePermission": "Chaka listens for your voice commands.",
+          "speechRecognitionPermission": "Chaka transcribes your speech into commands."
+        }
+      ],
+      [
+        "expo-media-library",
+        {
+          "photosPermission": "Chaka searches your photos and videos when you ask.",
+          "savePhotosPermission": "Chaka can save media when you ask."
+        }
+      ],
+      [
+        "expo-contacts",
+        {
+          "contactsPermission": "Chaka looks up contacts when you ask it to message or call someone."
+        }
+      ],
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Chaka uses the camera for the flashlight and camera actions."
+        }
+      ],
+      [
+        "expo-location",
+        {
+          "locationWhenInUsePermission": "Chaka uses your location for weather and nearby answers."
+        }
+      ],
+      [
+        "expo-calendar",
+        {
+          "calendarPermission": "Chaka reads and creates calendar events when you ask."
+        }
+      ],
+      "expo-notifications",
+      "expo-brightness",
+      "expo-font",
+      "expo-sharing"
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "922c465c-2a44-4d6a-a3ab-e4ed50480158"
+      }
+    },
+    "owner": "chaka-myths-team",
+    "runtimeVersion": {
+      "policy": "appVersion"
+    },
+    "updates": {
+      "url": "https://u.expo.dev/922c465c-2a44-4d6a-a3ab-e4ed50480158"
     }
   }
 }

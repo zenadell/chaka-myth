@@ -1,0 +1,21 @@
+plugins {
+  id 'com.android.library'
+  id 'expo-module-gradle-plugin'
+}
+
+group = 'com.chakamyth.hands'
+version = '0.1.0'
+
+android {
+  namespace "com.chakamyth.hands"
+  defaultConfig {
+    minSdkVersion 24
+    versionCode 1
+    versionName '0.1.0'
+  }
+}
+
+dependencies {
+  // FileProvider, for handing the downloaded update APK to the system installer.
+  implementation 'androidx.core:core-ktx:1.13.1'
+}

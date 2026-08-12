@@ -39,3 +39,11 @@ yarn-error.*
 # generated native folders
 /ios
 /android
+
+# build outputs — releases are published to GitHub Releases, never committed
+*.apk
+*.aab
+
+# native module build artifacts
+modules/*/android/build/
+modules/*/android/.gradle/

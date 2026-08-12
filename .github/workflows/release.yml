@@ -1,0 +1,74 @@
+name: Build & Release APK
+
+# Builds a signed-by-debug-key release APK and publishes it to GitHub Releases,
+# so the app can find and install its own update. Triggers when app.json's
+# version changes on main (or manually).
+on:
+  push:
+    branches: [main]
+    paths: ["app.json"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version from app.json
+        id: v
+        run: echo "version=$(node -p "require('./app.json').expo.version")" >> "$GITHUB_OUTPUT"
+
+      - name: Skip if this version is already released
+        id: check
+        run: |
+          if gh release view "v${{ steps.v.outputs.version }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - uses: actions/setup-node@v4
+        if: steps.check.outputs.exists == 'false'
+        with:
+          node-version: 20
+          cache: npm
+
+      - uses: actions/setup-java@v4
+        if: steps.check.outputs.exists == 'false'
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: android-actions/setup-android@v3
+        if: steps.check.outputs.exists == 'false'
+
+      - name: Install dependencies
+        if: steps.check.outputs.exists == 'false'
+        run: npm ci
+
+      - name: Generate native project
+        if: steps.check.outputs.exists == 'false'
+        run: npx expo prebuild --platform android --no-install
+
+      - name: Build release APK
+        if: steps.check.outputs.exists == 'false'
+        run: ./gradlew :app:assembleRelease -PreactNativeArchitectures=arm64-v8a --no-daemon
+        working-directory: android
+
+      - name: Publish release
+        if: steps.check.outputs.exists == 'false'
+        run: |
+          cp android/app/build/outputs/apk/release/app-release.apk \
+             "chaka-myth-${{ steps.v.outputs.version }}.apk"
+          gh release create "v${{ steps.v.outputs.version }}" \
+            "chaka-myth-${{ steps.v.outputs.version }}.apk" \
+            --title "Chaka-Myth ${{ steps.v.outputs.version }}" \
+            --notes "Automated build of v${{ steps.v.outputs.version }}."
+        env:
+          GH_TOKEN: ${{ github.token }}
