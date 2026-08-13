@@ -179,6 +179,15 @@ class ChakaLive(
 
       override fun onClosed(ws: WebSocket, code: Int, reason: String) {
         Log.i(TAG, "socket closed $code $reason")
+        // 1007 (invalid argument) / 1008 (policy) mean the request itself is
+        // being rejected — a bad key or exhausted Live quota. Reconnecting just
+        // hammers the API and burns more of it, so stop and say so plainly.
+        if (code == 1007 || code == 1008) {
+          Log.e(TAG, "fatal close $code — not retrying: $reason")
+          ChakaGuideOverlay.update("Live unavailable: $reason (check the Gemini key / Live quota)")
+          stop()
+          return
+        }
         if (!cancelled) reconnect("session ended") else stop()
       }
     })
@@ -308,6 +317,22 @@ class ChakaLive(
       // the tool — see checkTurn().
       .put("outputAudioTranscription", JSONObject())
       .put("inputAudioTranscription", JSONObject())
+      // Voice-activity detection tuning. On default sensitivity, room noise and
+      // her own voice leaking into the mic kept registering as the user barging
+      // in — turns were cut off constantly and often ended with nothing said.
+      // Low sensitivity + a longer silence window means she only yields when
+      // someone is genuinely talking to her.
+      .put(
+        "realtimeInputConfig",
+        JSONObject().put(
+          "automaticActivityDetection",
+          JSONObject()
+            .put("startOfSpeechSensitivity", "START_SENSITIVITY_LOW")
+            .put("endOfSpeechSensitivity", "END_SENSITIVITY_LOW")
+            .put("prefixPaddingMs", 300)
+            .put("silenceDurationMs", 900)
+        )
+      )
 
     return JSONObject().put(
       "setup",
