@@ -29,7 +29,11 @@ class ChakaOperator(private val service: ChakaAccessibilityService) {
     private const val TAG = "ChakaOperator"
     private const val CHAKA_PKG = "com.chakamyth.app"
     private const val CALL_TIMEOUT = 25000
-    private const val RUN_BUDGET_MS = 180000L
+    // Long enough to actually FINISH a real task in one run. Timing out and
+    // letting the chat model retry meant every attempt restarted from zero,
+    // which is what turned simple tasks into 30-60 minute ordeals.
+    private const val RUN_BUDGET_MS = 600000L
+    private const val MAX_BATCH = 4
 
     private val APP_MAP = mapOf(
       "spotify" to "com.spotify.music",
@@ -61,7 +65,13 @@ class ChakaOperator(private val service: ChakaAccessibilityService) {
 - {"type":"navigate","url":"https://example.com"}  open a WEBSITE in the browser — use this to GO TO a site rather than relying on whatever browser tab happens to be open
 - {"type":"wait"}                 wait ~1s for loading
 - {"type":"done","result":"...","return":true|false}  goal achieved
-- {"type":"fail","reason":"..."}  genuinely stuck"""
+- {"type":"fail","reason":"..."}  genuinely stuck
+
+SPEED — batch what you're sure of. Return "actions": an ARRAY of 1-4 actions to run back-to-back, so an obvious sequence costs one turn instead of four. Classic: [tap the search box, type the query, press enter].
+- Batch ONLY steps you can predict without seeing the result. Stop the batch where you'd need to LOOK first (e.g. after a search you must see the results before tapping one).
+- Put at most ONE tap_index in a batch and put it FIRST — indices go stale once the screen moves.
+- "open"/"navigate" must be the LAST action in a batch.
+- Unsure? Send a single action. A wrong batch costs more than an extra turn."""
 
     private const val RULES = """Rules:
 - Prefer tap_index. Use tap x,y fractions only for things not listed. To search: tap the input field, type, then enter.
@@ -263,58 +273,89 @@ class ChakaOperator(private val service: ChakaAccessibilityService) {
       lastExpected = decision.optString("expected", "")
       log("step ${step + 1}: verify=\"${decision.optString("verify")}\" sub-goal ${currentStep + 1}/$planLen done=${decision.optBoolean("step_done", false)}")
 
-      val action = decision.optJSONObject("action")
-      if (action == null) {
+      // A decision may carry a short SEQUENCE of confident actions ("actions"),
+      // so an obvious run like tap-field → type → enter costs ONE model call
+      // instead of three. Falls back to the single "action" form.
+      val batch = decision.optJSONArray("actions")
+        ?: decision.optJSONObject("action")?.let { JSONArray().put(it) }
+      if (batch == null || batch.length() == 0) {
         transcript.add("step ${step + 1}: decision had no action")
         continue
       }
 
-      val type = action.optString("type")
-      log("step ${step + 1}: action=$action")
-      if (type == "done") return outcome("done", action.optString("result", "Done."), useVision, transcript, action.optBoolean("return", false))
-      if (type == "fail") return outcome("fail", action.optString("reason", "Stuck."), useVision, transcript, true)
+      var curDump = dump
+      var curSig = sig
+      var batchBlocked = false
 
-      if (type == "open") {
-        if (openedApp) { delay(600); continue }
-        openedApp = true
-      }
+      for (bi in 0 until minOf(batch.length(), MAX_BATCH)) {
+        if (cancelled) return outcome("stopped", "You stopped it.", useVision, transcript)
+        val action = batch.optJSONObject(bi) ?: break
+        val type = action.optString("type")
+        log("step ${step + 1}.${bi + 1}: action=$action")
 
-      // --- Hard loop-breaker -------------------------------------------------
-      val aSig = actionSig(action)
-      repeatCount = if (aSig == lastActionSig) repeatCount + 1 else 1
-      lastActionSig = aSig
-      // navigate/open to the SAME target is never right twice (that's the
-      // page-reload loop); scrolling may legitimately repeat a few times.
-      val limit = when (type) { "navigate", "open" -> 1; "swipe" -> 3; "wait" -> 2; else -> 2 }
-      if (repeatCount > limit) {
-        blocks++
-        log("BLOCKED repeat #$repeatCount of $aSig (limit $limit)")
-        transcript.add("step ${step + 1}: (blocked — tried '$aSig' $repeatCount times)")
-        if (blocks >= 3) {
-          return outcome("fail", reflectFailure(goal, transcript, deepseekKey), useVision, transcript, true)
+        if (type == "done") return outcome("done", action.optString("result", "Done."), useVision, transcript, action.optBoolean("return", false))
+        if (type == "fail") return outcome("fail", action.optString("reason", "Stuck."), useVision, transcript, true)
+
+        if (type == "open") {
+          if (openedApp) { delay(400); break }
+          openedApp = true
         }
-        blockedHint = "BLOCKED: you already did '$aSig' $repeatCount times and it did NOT get you closer. " +
-          "Do NOT do it again. Look at what's actually on the screen now and take a DIFFERENT action " +
-          "(a different element, a different route). If a login/sign-in is in the way, sign in. " +
-          "If it's truly impossible, reply fail with the reason."
-        repeatCount = 0
-        delay(250)
-        continue
+
+        // Mid-batch the screen has moved, so refresh our model of it and make
+        // sure an index-based tap still points at the SAME element.
+        if (bi > 0) {
+          val fresh = runCatching { JSONObject(service.dumpScreen()) }.getOrNull()
+          if (fresh == null) break
+          if (type == "tap_index" && !sameElement(curDump, fresh, action.optInt("index", -1))) {
+            transcript.add("step ${step + 1}: (batch stopped — screen moved, re-checking)")
+            log("batch aborted at ${bi + 1}: element ${action.optInt("index", -1)} no longer matches")
+            break
+          }
+          curDump = fresh
+          curSig = signature(fresh)
+        }
+
+        // --- Hard loop-breaker -----------------------------------------------
+        val aSig = actionSig(action)
+        repeatCount = if (aSig == lastActionSig) repeatCount + 1 else 1
+        lastActionSig = aSig
+        // navigate/open to the SAME target is never right twice (that's the
+        // page-reload loop); scrolling may legitimately repeat a few times.
+        val limit = when (type) { "navigate", "open" -> 1; "swipe" -> 3; "wait" -> 2; else -> 2 }
+        if (repeatCount > limit) {
+          blocks++
+          log("BLOCKED repeat #$repeatCount of $aSig (limit $limit)")
+          transcript.add("step ${step + 1}: (blocked — tried '$aSig' $repeatCount times)")
+          if (blocks >= 3) {
+            return outcome("fail", reflectFailure(goal, transcript, deepseekKey), useVision, transcript, true)
+          }
+          blockedHint = "BLOCKED: you already did '$aSig' $repeatCount times and it did NOT get you closer. " +
+            "Do NOT do it again. Look at what's actually on the screen now and take a DIFFERENT action " +
+            "(a different element, a different route). If a login/sign-in is in the way, sign in. " +
+            "If it's truly impossible, reply fail with the reason."
+          repeatCount = 0
+          batchBlocked = true
+          break
+        }
+        // ---------------------------------------------------------------------
+
+        val did = dispatch(action, curDump)
+        lastActionType = type
+        lastSwipeDir = if (type == "swipe") action.optString("direction") else ""
+        lastSwipeAmount = if (type == "swipe") action.optString("amount", "normal") else ""
+        val progressTag = if (planLen > 0) "[${currentStep + 1}/$planLen] " else ""
+        transcript.add("step ${step + 1}: $progressTag$did")
+        log("step ${step + 1}.${bi + 1}: did=$did")
+
+        // Adaptive settle: continue as soon as the screen actually changes rather
+        // than always sleeping the worst case.
+        val maxSettle = when (type) { "open", "navigate" -> 3000L; "wait" -> 1200L; "type" -> 900L; else -> 1600L }
+        awaitSettle(curSig, if (type == "type") 200L else 260L, maxSettle)
+
+        // A context switch invalidates everything after it.
+        if (type == "open" || type == "navigate") break
       }
-      // -----------------------------------------------------------------------
-
-      val did = dispatch(action, dump)
-      lastActionType = type
-      lastSwipeDir = if (type == "swipe") action.optString("direction") else ""
-      lastSwipeAmount = if (type == "swipe") action.optString("amount", "normal") else ""
-      val progressTag = if (planLen > 0) "[${currentStep + 1}/$planLen] " else ""
-      transcript.add("step ${step + 1}: $progressTag$did")
-      log("step ${step + 1}: did=$did")
-
-      // Adaptive settle: return as soon as the screen actually changes instead of
-      // always sleeping the worst case. Fast screens now cost ~300ms, not 1.5s.
-      val maxSettle = when (type) { "open", "navigate" -> 3000L; "wait" -> 1200L; "type" -> 900L; else -> 1600L }
-      awaitSettle(sig, if (type == "type") 250L else 300L, maxSettle)
+      if (batchBlocked) { delay(200); continue }
     }
 
     return outcome("exhausted", reflectFailure(goal, transcript, deepseekKey), useVision, transcript, true)
@@ -356,6 +397,26 @@ class ChakaOperator(private val service: ChakaAccessibilityService) {
       .put("detail", detail)
       .put("perception", if (vision) "vision+tree" else "accessibility tree")
       .put("steps", JSONArray(transcript))
+  }
+
+  /**
+   * True when index [i] still refers to the same element it did in [before].
+   * Indices are positional, so once the screen moves a batched tap could land on
+   * something entirely different — this is the guard against that.
+   */
+  private fun sameElement(before: JSONObject, after: JSONObject, i: Int): Boolean {
+    if (i < 0) return false
+    fun labelOf(d: JSONObject): String? {
+      val els = d.optJSONArray("els") ?: return null
+      for (k in 0 until els.length()) {
+        val e = els.optJSONObject(k) ?: continue
+        if (e.optInt("i") == i) return e.optString("text", e.optString("desc", "")) + "|" + e.optString("cls")
+      }
+      return null
+    }
+    val a = labelOf(before) ?: return false
+    val b = labelOf(after) ?: return false
+    return a == b
   }
 
   /** Stable fingerprint of an action + its target, for repeat detection. */
@@ -527,7 +588,7 @@ class ChakaOperator(private val service: ChakaAccessibilityService) {
       "EVERY TURN: 1) observe what's on screen. 2) VERIFY your last action against what you expected — if it didn't happen, say why and change approach; never pretend or repeat it. 3) tick the current sub-goal ONLY when the screen proves it, and revise the plan if reality diverged (login wall, error, popup). 4) choose ONE next action and state what you expect to see.\n" +
       "Finish (action done) only when the screen proves every sub-goal is met — put the real answer/result in done.result. If genuinely blocked after trying alternatives, action fail with the reason.\n\n" +
       "Reply with ONLY this JSON:\n" +
-      "{\"observation\":\"what's on screen\",\"verify\":\"did my last action do what I expected? yes/no + why\",\"plan\":[\"sub-goal 1\",\"sub-goal 2\"],\"step_index\":<0-based sub-goal you're on NOW>,\"step_done\":<true if it's now complete>,\"thought\":\"brief\",\"action\":{...ONE action...},\"expected\":\"what the screen should look like right after this action\"}\n\n" +
+      "{\"observation\":\"what's on screen\",\"verify\":\"did my last action do what I expected? yes/no + why\",\"plan\":[\"sub-goal 1\",\"sub-goal 2\"],\"step_index\":<0-based sub-goal you're on NOW>,\"step_done\":<true if it's now complete>,\"thought\":\"brief\",\"actions\":[{...},{...}],\"expected\":\"what the screen should look like after the LAST action\"}\n\n" +
       "$ACTION_MENU\n\n$RULES\n\n" +
       "GOAL: $goal\n\n" +
       "YOUR PLAN (keep stable; revise only when reality forces it):\n${planText(plan, currentStep)}\nYou are on sub-goal #${currentStep + 1}.\n" +

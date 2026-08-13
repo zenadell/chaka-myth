@@ -385,7 +385,7 @@ export const operateScreen: Tool = {
           String(args.goal),
           apiKey ?? "",
           geminiKey,
-          Number(args.maxSteps) || 18,
+          Number(args.maxSteps) || 24,
           args.app ? String(args.app) : null
         );
         log(`NATIVE OUTCOME=${result.outcome} detail="${result.detail}"`);
@@ -396,6 +396,13 @@ export const operateScreen: Tool = {
             perception: result.perception,
             detail: result.detail,
             steps: result.steps,
+            // Without this the model just re-runs the same goal after a failure —
+            // and every retry starts from scratch, which is what turned simple
+            // tasks into 30+ minute ordeals.
+            guidance:
+              result.outcome === "done"
+                ? "Report the result to the user."
+                : "Do NOT silently re-run the same goal — it already ran a full attempt and the retry would start over from the beginning. Tell the user plainly how far you got and what blocked it (see steps). Only try again if you have a genuinely DIFFERENT and more specific goal, otherwise ask the user how they want to proceed.",
           },
         };
       } finally {
