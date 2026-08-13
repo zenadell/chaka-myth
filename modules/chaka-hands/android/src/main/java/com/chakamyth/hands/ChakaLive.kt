@@ -85,6 +85,8 @@ class ChakaLive(
   @Volatile private var lastMsgAt = 0L
   @Volatile private var connectedAt = 0L
   @Volatile private var attempts = 0
+  // True when the failure was "no network at all" (e.g. a call suspended data).
+  @Volatile private var offline = false
   private var supervisorThread: Thread? = null
   private var lastGoal = ""
   private var lastKey = ""
@@ -186,8 +188,13 @@ class ChakaLive(
       }
 
       override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
-        Log.e(TAG, "socket failure: ${t.message} code=${response?.code}")
-        if (!cancelled) reconnect("connection dropped") else stop()
+        val why = t.message ?: ""
+        Log.e(TAG, "socket failure: $why code=${response?.code}")
+        // On 2G/3G a voice call suspends mobile data, so DNS fails outright.
+        // Nothing to do but wait for the network to come back — retry calmly
+        // instead of hammering it every few seconds.
+        offline = why.contains("Unable to resolve host") || why.contains("No address associated")
+        if (!cancelled) reconnect(if (offline) "no network" else "connection dropped") else stop()
       }
 
       override fun onClosed(ws: WebSocket, code: Int, reason: String) {
@@ -245,7 +252,7 @@ class ChakaLive(
     readyAt = 0
     // Never give up. This has to survive unattended on a phone whose screen
     // can't be touched, so it keeps retrying with a capped backoff forever.
-    val wait = minOf(800L * attempts, 10000L)
+    val wait = if (offline) 6000L else minOf(800L * attempts, 10000L)
     Log.i(TAG, "reconnecting ($why) attempt=$attempts wait=${wait}ms handle=${resumeHandle?.take(12) ?: "none"}")
     ChakaGuideOverlay.update("Reconnecting…")
     Thread {
@@ -272,6 +279,10 @@ class ChakaLive(
       "- NEVER ask permission to continue: no 'shall I go on?', 'would you like me to…?', 'what would you like to do?'. They already told you the task — execute all of it.\n" +
       "- If they had to repeat themselves or tell you to 'do it already', you failed. Never let that happen.\n" +
       "- A task stays OPEN until you call task_done. While it is open you must keep acting on your own — nobody is going to prompt you. Call task_done the moment the screen proves it's finished.\n" +
+      "- Words like 'ok', 'go on', 'continue', 'yes' are NOT required and you must never wait for them. Treat every instruction as pre-approved: the moment you know the next step, take it.\n" +
+      "- A tool result is not the end of your work — it's the middle. After each one, immediately do the next thing. Ending your turn with the task unfinished and nothing pending is a failure.\n" +
+      "- When you call task_done, SAY what you did and anything the user needs to know. Never finish in silence and make them ask 'are you done?'.\n" +
+      "- If the connection drops (they may be on a call), pick straight back up when you return — say you're back and resume any unfinished task.\n" +
       "\nNEVER CLAIM SOMETHING YOU HAVE NOT VERIFIED:\n" +
       "- Do not say an app is open, a photo is tapped, or a message is sent unless the CURRENT screen proves it. Check read_screen or the latest frame first.\n" +
       "- If the screen shows something different from what you expected, say so plainly and fix it. Do not insist it worked.\n" +
@@ -420,6 +431,10 @@ class ChakaLive(
     if (msg.has("setupComplete")) {
       Log.i(TAG, "setup complete — starting audio + frames")
       ready = true
+      if (offline) {
+        offline = false
+        sendText(ws, "[SYSTEM] You just came back online after losing connection (the user may have been on a call). Greet them briefly, tell them you're back, and if a task was still unfinished, resume it now.")
+      }
       drives = 0
       lastDriveAt = System.currentTimeMillis()
       readyAt = System.currentTimeMillis()
@@ -602,7 +617,11 @@ class ChakaLive(
           // Only step in once she's genuinely stalled — not between her own
           // actions, and never straight after the user has spoken.
           if (System.currentTimeMillis() - lastActivityAt < 8000) continue
-          if (drives >= 4) continue  // stalled on something real — stop pushing
+          // Never stop pushing while a task is open — going quiet and waiting
+          // to be pressured is the exact behaviour we're eliminating. The 12s
+          // floor keeps it civil; the ceiling only exists to catch a task that
+          // was never closed out (~10 minutes of prodding).
+          if (drives >= 50) continue
           // Never prod twice in quick succession, whatever the screen is doing.
           val now2 = System.currentTimeMillis()
           if (now2 - lastDriveAt < MIN_DRIVE_GAP_MS) continue
@@ -888,7 +907,14 @@ class ChakaLive(
         drives = 0
         Log.i(TAG, "task_done: ${args.optString("summary")}")
         ChakaGuideOverlay.update("✓ ${args.optString("summary").take(140)}")
-        JSONObject().put("ok", true)
+        // She used to fall silent here and the user had to ask "are you done?".
+        // The result carries the instruction to actually report back.
+        JSONObject()
+          .put("ok", true)
+          .put(
+            "next",
+            "Now SAY OUT LOUD, in one short natural sentence, what you finished and anything the user needs to know from the screen. Do not stay silent."
+          )
       }
       "answer_call" -> JSONObject().put("ok", service.answerCall())
       "end_call" -> JSONObject().put("ok", service.endCall())
