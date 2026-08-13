@@ -75,6 +75,8 @@ class ChakaLive(
   // or a half-open socket OkHttp never reports. The mic keeps recording into a
   // dead connection and everything just goes quiet. This watches liveness
   // independently of the socket callbacks and forces a reconnect.
+  private val frameLock = Object()
+  @Volatile private var lastFrameAt = 0L
   @Volatile private var lastMsgAt = 0L
   @Volatile private var connectedAt = 0L
   @Volatile private var attempts = 0
@@ -92,12 +94,18 @@ class ChakaLive(
     // Android's accessibility-screenshot rate limit. ~1.4s is a safe cadence.
     private const val FRAME_MS = 1400L
     private const val MIC_RATE = 16000   // required input rate
+    // Frames are ~5x the cost of audio on the uplink. Small and throttled.
+    private const val LIVE_FRAME_WIDTH = 760
+    private const val LIVE_FRAME_QUALITY = 55
+    private const val MIN_FRAME_GAP_MS = 2500L
     private const val OUT_RATE = 24000   // model's audio output rate
   }
 
   private val client = OkHttpClient.Builder()
     .readTimeout(0, TimeUnit.MILLISECONDS)  // keep the stream open indefinitely
-    .pingInterval(20, TimeUnit.SECONDS)
+    // Ping generously: a burst of upstream data shouldn't be mistaken for a
+    // dead peer. Real death is detected by the supervisor instead.
+    .pingInterval(45, TimeUnit.SECONDS)
     .build()
 
   fun start(goal: String, apiKey: String, model: String) {
@@ -402,18 +410,7 @@ class ChakaLive(
       // and asks permission" problem. Fresh state = she just keeps going.
       Thread {
         Thread.sleep(700)  // let the UI settle after the action
-        if (!cancelled && ready) {
-          captureBlocking()?.let { shot ->
-            runCatching {
-              ws.send(
-                JSONObject().put(
-                  "realtimeInput",
-                  JSONObject().put("video", JSONObject().put("mimeType", "image/jpeg").put("data", shot))
-                ).toString()
-              )
-            }
-          }
-        }
+        if (!cancelled && ready) sendFrame(ws)
       }.also { it.isDaemon = true }.start()
       return
     }
@@ -503,14 +500,7 @@ class ChakaLive(
       if (cancelled || !ready) return@Thread
       Log.i(TAG, "NUDGE $nudges — talked without acting: \"${said.take(70)}\"")
       runCatching {
-        captureBlocking()?.let { shot ->
-          ws.send(
-            JSONObject().put(
-              "realtimeInput",
-              JSONObject().put("video", JSONObject().put("mimeType", "image/jpeg").put("data", shot))
-            ).toString()
-          )
-        }
+        sendFrame(ws, force = true)
         ws.send(
           JSONObject().put(
             "realtimeInput",
@@ -556,14 +546,7 @@ class ChakaLive(
           drives++
           Log.i(TAG, "DRIVE $drives — task open, idle ${(System.currentTimeMillis() - lastToolAt) / 1000}s")
 
-          captureBlocking()?.let { shot ->
-            ws.send(
-              JSONObject().put(
-                "realtimeInput",
-                JSONObject().put("video", JSONObject().put("mimeType", "image/jpeg").put("data", shot))
-              ).toString()
-            )
-          }
+          sendFrame(ws, force = true)
           ws.send(
             JSONObject().put(
               "realtimeInput",
@@ -683,13 +666,7 @@ class ChakaLive(
           lastSig = sig
           lastSentAt = now
 
-          val shot = captureBlocking() ?: continue
-          ws.send(
-            JSONObject().put(
-              "realtimeInput",
-              JSONObject().put("video", JSONObject().put("mimeType", "image/jpeg").put("data", shot))
-            ).toString()
-          )
+          if (!sendFrame(ws)) continue
         } catch (e: InterruptedException) {
           return@Thread
         } catch (e: Exception) {
@@ -699,11 +676,40 @@ class ChakaLive(
     }.also { it.isDaemon = true; it.start() }
   }
 
+  /**
+   * The ONE place frames go out. Everything that wants to show her the screen
+   * comes through here so the uplink can't be flooded.
+   *
+   * This was the cause of sessions dying: three independent senders (the frame
+   * loop, one after every tool call, one per drive tick) each pushing a ~250KB
+   * base64 JPEG. That saturated the uplink, pings couldn't get through inside
+   * their 20s window, and OkHttp declared the socket dead. Frames now cost
+   * roughly a fifth as much and are rate-limited.
+   */
+  private fun sendFrame(ws: WebSocket, force: Boolean = false): Boolean {
+    val now = System.currentTimeMillis()
+    synchronized(frameLock) {
+      if (!force && now - lastFrameAt < MIN_FRAME_GAP_MS) return false
+      lastFrameAt = now
+    }
+    val shot = captureBlocking() ?: return false
+    return runCatching {
+      ws.send(
+        JSONObject().put(
+          "realtimeInput",
+          JSONObject().put("video", JSONObject().put("mimeType", "image/jpeg").put("data", shot))
+        ).toString()
+      )
+    }.getOrDefault(false)
+  }
+
   private fun captureBlocking(): String? {
     var result: String? = null
     val lock = Object()
     var done = false
-    service.captureScreenshot(null) { b64 ->
+    // Small + cheap: she needs to recognise the screen, not read fine print, and
+    // read_screen gives her exact labels anyway.
+    service.captureScreenshot(null, LIVE_FRAME_WIDTH, LIVE_FRAME_QUALITY) { b64 ->
       synchronized(lock) { result = b64; done = true; lock.notifyAll() }
     }
     synchronized(lock) {

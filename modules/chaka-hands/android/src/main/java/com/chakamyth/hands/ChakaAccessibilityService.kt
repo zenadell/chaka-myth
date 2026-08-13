@@ -190,17 +190,22 @@ class ChakaAccessibilityService : AccessibilityService() {
    * Retries once after ~1.1s if it fails — Android rate-limits accessibility
    * screenshots to roughly one per second, so a fast second call can fail.
    */
-  fun captureScreenshot(marks: JSONArray? = null, onResult: (String?) -> Unit) {
-    captureOnce(marks) { b64 ->
+  fun captureScreenshot(
+    marks: JSONArray? = null,
+    maxWidth: Int = 1240,
+    quality: Int = 84,
+    onResult: (String?) -> Unit
+  ) {
+    captureOnce(marks, maxWidth, quality) { b64 ->
       if (b64 != null) {
         onResult(b64)
       } else {
-        Handler(Looper.getMainLooper()).postDelayed({ captureOnce(marks, onResult) }, 1100)
+        Handler(Looper.getMainLooper()).postDelayed({ captureOnce(marks, maxWidth, quality, onResult) }, 1100)
       }
     }
   }
 
-  private fun captureOnce(marks: JSONArray?, onResult: (String?) -> Unit) {
+  private fun captureOnce(marks: JSONArray?, maxWidth: Int, quality: Int, onResult: (String?) -> Unit) {
     if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
       onResult(null)
       return
@@ -227,12 +232,12 @@ class ChakaAccessibilityService : AccessibilityService() {
                 onResult(null)
                 return
               }
-              val scaled = downscale(soft, 1240)
+              val scaled = downscale(soft, maxWidth)
               // Set-of-Marks: draw numbered boxes on tappable elements so the
               // model taps by index instead of guessing pixel coordinates.
               val marked = if (marks != null) drawMarks(scaled, marks, soft.width) else scaled
               val stream = ByteArrayOutputStream()
-              marked.compress(Bitmap.CompressFormat.JPEG, 84, stream)
+              marked.compress(Bitmap.CompressFormat.JPEG, quality, stream)
               val b64 = Base64.encodeToString(stream.toByteArray(), Base64.NO_WRAP)
               Log.i("ChakaHands", "screenshot OK: ${b64.length} b64 chars marks=${marks?.length() ?: 0}")
               onResult(b64)
