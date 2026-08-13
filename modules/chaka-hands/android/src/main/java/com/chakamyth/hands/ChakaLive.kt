@@ -140,8 +140,11 @@ class ChakaLive(
           if (reconnecting) continue
           val now = System.currentTimeMillis()
 
-          // Connected, but the server has gone completely quiet.
-          if (ready && lastMsgAt > 0 && now - lastMsgAt > 45000) {
+          // Connected, but the server has gone completely quiet. Kept short:
+          // this is dead air the user is sitting through, and on a phone that
+          // can't be touched it's the only thing standing between them and a
+          // working assistant.
+          if (ready && lastMsgAt > 0 && now - lastMsgAt > 20000) {
             Log.w(TAG, "no server message for ${(now - lastMsgAt) / 1000}s — session is dead")
             reconnect("went quiet")
             continue
@@ -330,9 +333,15 @@ class ChakaLive(
       // Audio+video sessions are capped at ~2 MINUTES without this — a sliding
       // context window removes the duration limit entirely. This is why Live
       // Mode was dying mid-task.
+      // Without this, audio+video sessions are capped at ~2 minutes — which is
+      // exactly how long every session was lasting. int64 fields must be sent as
+      // STRINGS in Google's proto-JSON mapping; passing a number made the whole
+      // block invalid, so the cap kept applying (and likely caused the 1007s).
       .put(
         "contextWindowCompression",
-        JSONObject().put("slidingWindow", JSONObject()).put("triggerTokens", 16000)
+        JSONObject()
+          .put("triggerTokens", "16000")
+          .put("slidingWindow", JSONObject().put("targetTokens", "8000"))
       )
       // Ask for resumption handles so a dropped connection can be picked up
       // where it left off instead of starting over.
