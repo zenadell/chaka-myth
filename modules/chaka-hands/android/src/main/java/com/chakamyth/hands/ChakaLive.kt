@@ -92,12 +92,12 @@ class ChakaLive(
       "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
     // The Live API accepts image input at <= 1 FPS, which happens to match
     // Android's accessibility-screenshot rate limit. ~1.4s is a safe cadence.
-    private const val FRAME_MS = 1400L
+    private const val FRAME_MS = 1200L
     private const val MIC_RATE = 16000   // required input rate
     // Frames are ~5x the cost of audio on the uplink. Small and throttled.
     private const val LIVE_FRAME_WIDTH = 760
     private const val LIVE_FRAME_QUALITY = 55
-    private const val MIN_FRAME_GAP_MS = 2500L
+    private const val MIN_FRAME_GAP_MS = 1500L
     private const val OUT_RATE = 24000   // model's audio output rate
   }
 
@@ -526,16 +526,11 @@ class ChakaLive(
       Log.i(TAG, "NUDGE $nudges — talked without acting: \"${said.take(70)}\"")
       runCatching {
         sendFrame(ws, force = true)
-        ws.send(
-          JSONObject().put(
-            "realtimeInput",
-            JSONObject().put(
-              "text",
-              "[SYSTEM] You just spoke without calling any tool, so NOTHING happened on the phone. " +
-                "The screen above is the real current state. Do not reply with words. " +
-                "Call the tool that performs the next step RIGHT NOW, then keep calling tools until the task is done."
-            )
-          ).toString()
+        sendText(
+          ws,
+          "[SYSTEM] You just spoke without calling any tool, so NOTHING happened on the phone. " +
+            "The screen above is the real current state. Do not reply with words. " +
+            "Call the tool that performs the next step RIGHT NOW, then keep calling tools until the task is done."
         )
       }
     }.also { it.isDaemon = true }.start()
@@ -556,7 +551,7 @@ class ChakaLive(
     driveThread = Thread {
       while (!cancelled && ready) {
         try {
-          Thread.sleep(2500)
+          Thread.sleep(1500)
           if (!taskActive) continue
           // Give her room to work: only step in once she's been idle a while.
           if (System.currentTimeMillis() - lastToolAt < 5000) continue
@@ -572,16 +567,11 @@ class ChakaLive(
           Log.i(TAG, "DRIVE $drives — task open, idle ${(System.currentTimeMillis() - lastToolAt) / 1000}s")
 
           sendFrame(ws, force = true)
-          ws.send(
-            JSONObject().put(
-              "realtimeInput",
-              JSONObject().put(
-                "text",
-                "[SYSTEM] The task is still open and you have stopped acting. This is the live screen. " +
-                  "Do not reply with words. Either call the next tool to move the task forward, " +
-                  "or call task_done if the screen proves it is finished."
-              )
-            ).toString()
+          sendText(
+            ws,
+            "[SYSTEM] The task is still open and you have stopped acting. This is the live screen. " +
+              "Do not reply with words. Either call the next tool to move the task forward, " +
+              "or call task_done if the screen proves it is finished."
           )
         } catch (e: InterruptedException) {
           return@Thread
@@ -711,6 +701,31 @@ class ChakaLive(
    * their 20s window, and OkHttp declared the socket dead. Frames now cost
    * roughly a fifth as much and are rate-limited.
    */
+  /**
+   * Sends a text turn. This MUST be clientContent, not realtimeInput — the
+   * latter is for streaming media only, and pushing text through it is what was
+   * killing sessions: every death in the logs followed a drive/nudge, which
+   * were the only places text was sent. The server answered with close 1007
+   * ("invalid argument") or simply stopped responding.
+   */
+  private fun sendText(ws: WebSocket, text: String): Boolean = runCatching {
+    ws.send(
+      JSONObject().put(
+        "clientContent",
+        JSONObject()
+          .put(
+            "turns",
+            JSONArray().put(
+              JSONObject()
+                .put("role", "user")
+                .put("parts", JSONArray().put(JSONObject().put("text", text)))
+            )
+          )
+          .put("turnComplete", true)
+      ).toString()
+    )
+  }.getOrDefault(false)
+
   private fun sendFrame(ws: WebSocket, force: Boolean = false): Boolean {
     val now = System.currentTimeMillis()
     synchronized(frameLock) {
@@ -748,11 +763,10 @@ class ChakaLive(
 
   /** Sends a typed/spoken message from the user into the live session. */
   fun say(text: String) {
-    socket?.send(
-      JSONObject().put(
-        "realtimeInput", JSONObject().put("text", text)
-      ).toString()
-    )
+    val ws = socket ?: return
+    taskActive = true
+    nudges = 0
+    sendText(ws, text)
   }
 
   private fun executeTool(name: String, args: JSONObject): JSONObject {
