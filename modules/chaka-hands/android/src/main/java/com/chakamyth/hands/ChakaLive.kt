@@ -66,6 +66,10 @@ class ChakaLive(
   // Consecutive completed turns where she took no action at all — used to tell
   // "idle, needs a push" from "genuinely stuck, stop pushing".
   @Volatile private var idleTurns = 0
+  // Hard brake on auto-continue. Counting only inactive turns wasn't enough:
+  // when she flails (acting, but aimlessly) the counter kept resetting and the
+  // loop pushed forever — it once walked into App info and force-stopped Chaka.
+  @Volatile private var autoContinues = 0
   private val turnSaid = StringBuilder()
   // Goal-driven drive loop: keeps her working while a task is open, whether or
   // not anyone speaks. Live sessions otherwise only advance on conversation
@@ -289,6 +293,7 @@ class ChakaLive(
       "- OBSTACLES ARE YOURS TO CLEAR, not theirs. Permission dialogs (Allow / While using the app), cookie or consent banners, ads, 'Not now', update prompts, rating popups — deal with them yourself the instant they appear: accept what the task needs, dismiss or close anything it doesn't. Never stop and stare at a popup waiting for instructions.\n" +
       "- TYPING ACCURACY: type the EXACT words asked for. After typing, read the field back on screen and confirm it matches; if it's wrong, clear it and retype before searching. Searching for the wrong text wastes far more time than checking.\n" +
       "- Finish the whole intent, not the setup for it. 'Play X' means the song is PLAYING, not that you searched for it. 'Message X' means sent. Keep going until the real outcome is on screen.\n" +
+      "- STAY ON THE TASK. Only touch what the task needs. If you don't know what to do next, say so and ask — never wander through Settings, App info, recent apps or unrelated apps hoping to find something. Never force stop, uninstall, clear data, reset, delete or sign out of anything unless the user asked for that exact thing.\n" +
       "\nNEVER CLAIM SOMETHING YOU HAVE NOT VERIFIED:\n" +
       "- Do not say an app is open, a photo is tapped, or a message is sent unless the CURRENT screen proves it. Check read_screen or the latest frame first.\n" +
       "- If the screen shows something different from what you expected, say so plainly and fix it. Do not insist it worked.\n" +
@@ -518,6 +523,7 @@ class ChakaLive(
           nudges = 0
           drives = 0
           idleTurns = 0
+          autoContinues = 0
           // Critical: give her room to answer. Without this the drive loop fired
           // a [SYSTEM] turn on top of the user's turn and the session wedged.
           lastActivityAt = System.currentTimeMillis()
@@ -581,6 +587,19 @@ class ChakaLive(
     if (actedThisTurn) idleTurns = 0 else idleTurns++
     if (idleTurns >= 3) {
       Log.i(TAG, "auto-continue standing down after $idleTurns turns with no action")
+      return
+    }
+    // Even while she's acting, a task can't legitimately need dozens of pushes.
+    // Past this she's lost, and continuing to prod makes her flail.
+    autoContinues++
+    if (autoContinues > 12) {
+      Log.w(TAG, "auto-continue cap hit ($autoContinues) — standing down, asking for direction")
+      taskActive = false
+      sendText(
+        ws,
+        "[SYSTEM] You have taken many steps without finishing. STOP acting now. " +
+          "Tell the user plainly where you got to, what is blocking you, and ask what they want to do next."
+      )
       return
     }
     Thread {
@@ -874,6 +893,31 @@ class ChakaLive(
     sendText(ws, text)
   }
 
+  /** Label of element [i] on the current screen, if present. */
+  private fun elementLabel(dump: JSONObject, i: Int): String? {
+    val els = dump.optJSONArray("els") ?: return null
+    for (k in 0 until els.length()) {
+      val e = els.optJSONObject(k) ?: continue
+      if (e.optInt("i") == i) return e.optString("text", e.optString("desc", ""))
+    }
+    return null
+  }
+
+  /**
+   * Controls that can destroy data or disable the assistant. These are never
+   * safe to hit on the model's own initiative — only when the user asked for
+   * that specific thing, which they can confirm on the system's own dialog.
+   */
+  private fun isDestructive(label: String): Boolean {
+    val l = label.lowercase().trim()
+    return listOf(
+      "force stop", "uninstall", "clear data", "clear storage", "clear cache",
+      "factory reset", "reset all settings", "erase all data", "delete account",
+      "remove account", "format", "wipe", "disable", "deactivate", "log out",
+      "sign out", "delete all"
+    ).any { l.contains(it) }
+  }
+
   private fun executeTool(name: String, args: JSONObject): JSONObject {
     val dump = runCatching { JSONObject(service.dumpScreen()) }.getOrNull()
       ?: return JSONObject().put("error", "couldn't read the screen")
@@ -896,6 +940,22 @@ class ChakaLive(
       }
       "tap_index" -> {
         val idx = args.optInt("index", -1)
+        // Safety rail. A runaway continue-loop once walked into App info and
+        // force-stopped Chaka herself. Controls that destroy data or disable
+        // things are never worth an autonomous guess — the user must ask.
+        elementLabel(dump, idx)?.let { label ->
+          if (isDestructive(label)) {
+            Log.w(TAG, "BLOCKED destructive tap: \"$label\"")
+            return JSONObject()
+              .put("ok", false)
+              .put("blocked", true)
+              .put(
+                "error",
+                "\"$label\" is a destructive control and is blocked unless the user explicitly asked for it. " +
+                  "Do not try to reach it another way. Say what you were about to do and ask them."
+              )
+          }
+        }
         val els = dump.optJSONArray("els") ?: JSONArray()
         var hit: JSONObject? = null
         for (i in 0 until els.length()) {
@@ -947,6 +1007,7 @@ class ChakaLive(
         // She's declared completion, so the drive loop stops pushing her.
         taskActive = false
         drives = 0
+        autoContinues = 0
         Log.i(TAG, "task_done: ${args.optString("summary")}")
         ChakaGuideOverlay.update("✓ ${args.optString("summary").take(140)}")
         // She used to fall silent here and the user had to ask "are you done?".
