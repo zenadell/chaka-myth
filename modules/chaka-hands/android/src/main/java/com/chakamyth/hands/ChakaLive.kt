@@ -375,20 +375,20 @@ class ChakaLive(
       // the tool — see checkTurn().
       .put("outputAudioTranscription", JSONObject())
       .put("inputAudioTranscription", JSONObject())
-      // Voice-activity detection tuning. On default sensitivity, room noise and
-      // her own voice leaking into the mic kept registering as the user barging
-      // in — turns were cut off constantly and often ended with nothing said.
-      // Low sensitivity + a longer silence window means she only yields when
-      // someone is genuinely talking to her.
+      // Voice-activity detection. LOW sensitivity was tried to stop room noise
+      // cutting her off, but "low end-of-speech sensitivity" means slow to
+      // decide the user has STOPPED — turns stopped committing entirely and she
+      // went mute while still transcribing every word. Being interrupted
+      // occasionally beats never answering, so: default start sensitivity, and
+      // end-of-speech biased towards closing the turn promptly.
       .put(
         "realtimeInputConfig",
         JSONObject().put(
           "automaticActivityDetection",
           JSONObject()
-            .put("startOfSpeechSensitivity", "START_SENSITIVITY_LOW")
-            .put("endOfSpeechSensitivity", "END_SENSITIVITY_LOW")
-            .put("prefixPaddingMs", 300)
-            .put("silenceDurationMs", 900)
+            .put("endOfSpeechSensitivity", "END_SENSITIVITY_HIGH")
+            .put("prefixPaddingMs", 200)
+            .put("silenceDurationMs", 600)
         )
       )
 
