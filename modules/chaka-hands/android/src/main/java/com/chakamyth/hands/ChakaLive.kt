@@ -2,8 +2,15 @@ package com.chakamyth.hands
 
 import android.content.Context
 import android.content.Intent
+import android.media.AudioAttributes
+import android.media.AudioFormat
+import android.media.AudioManager
+import android.media.AudioRecord
+import android.media.AudioTrack
+import android.media.MediaRecorder
+import android.media.audiofx.AcousticEchoCanceler
 import android.net.Uri
-import android.speech.tts.TextToSpeech
+import android.util.Base64
 import android.util.Log
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -12,7 +19,6 @@ import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import org.json.JSONArray
 import org.json.JSONObject
-import java.util.Locale
 import java.util.concurrent.TimeUnit
 import kotlin.coroutines.resume
 import kotlin.coroutines.suspendCoroutine
@@ -38,11 +44,23 @@ class ChakaLive(
 
   @Volatile var cancelled = false
   private var socket: WebSocket? = null
-  private var tts: TextToSpeech? = null
   private var frameThread: Thread? = null
 
+  // Speech-to-speech: mic streams up as 16kHz PCM, the model's voice comes back
+  // as 24kHz PCM and is played straight out — no TTS in the middle.
+  private var micThread: Thread? = null
+  private var recorder: AudioRecord? = null
+  private var player: AudioTrack? = null
+  private var aec: AcousticEchoCanceler? = null
+
   @Volatile private var ready = false
-  @Volatile private var lastSpoken = ""
+  // Session resumption: the server hands out a token we can reconnect with, so
+  // a dropped socket resumes the conversation instead of losing the task.
+  @Volatile private var resumeHandle: String? = null
+  @Volatile private var reconnecting = false
+  private var lastGoal = ""
+  private var lastKey = ""
+  private var lastModel = ""
 
   companion object {
     private const val TAG = "ChakaLive"
@@ -52,6 +70,8 @@ class ChakaLive(
     // The Live API accepts image input at <= 1 FPS, which happens to match
     // Android's accessibility-screenshot rate limit. ~1.4s is a safe cadence.
     private const val FRAME_MS = 1400L
+    private const val MIC_RATE = 16000   // required input rate
+    private const val OUT_RATE = 24000   // model's audio output rate
   }
 
   private val client = OkHttpClient.Builder()
@@ -60,8 +80,14 @@ class ChakaLive(
     .build()
 
   fun start(goal: String, apiKey: String, model: String) {
-    initTts()
-    val req = Request.Builder().url("$WS?key=$apiKey").build()
+    lastGoal = goal; lastKey = apiKey; lastModel = model
+    connect()
+  }
+
+  private fun connect() {
+    val req = Request.Builder().url("$WS?key=$lastKey").build()
+    val goal = lastGoal
+    val model = lastModel
     socket = client.newWebSocket(req, object : WebSocketListener() {
 
       override fun onOpen(ws: WebSocket, response: Response) {
@@ -79,15 +105,37 @@ class ChakaLive(
 
       override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
         Log.e(TAG, "socket failure: ${t.message} code=${response?.code}")
-        ChakaGuideOverlay.update("Live connection dropped — ${t.message ?: "unknown"}")
-        stop()
+        if (!cancelled) reconnect("connection dropped") else stop()
       }
 
       override fun onClosed(ws: WebSocket, code: Int, reason: String) {
         Log.i(TAG, "socket closed $code $reason")
-        stop()
+        if (!cancelled) reconnect("session ended") else stop()
       }
     })
+  }
+
+  /**
+   * Reconnects transparently using the resumption handle. Live sessions expire
+   * (and connections recycle roughly every 10 minutes), so without this a long
+   * task would just die partway through.
+   */
+  private fun reconnect(why: String) {
+    if (cancelled || reconnecting) return
+    reconnecting = true
+    ready = false
+    // Tear down the audio/frame threads; connect() starts fresh ones on setup.
+    micThread?.interrupt(); micThread = null
+    frameThread?.interrupt(); frameThread = null
+    runCatching { recorder?.stop(); recorder?.release() }; recorder = null
+    runCatching { player?.pause(); player?.flush() }
+    Log.i(TAG, "reconnecting ($why) handle=${resumeHandle?.take(12) ?: "none"}")
+    ChakaGuideOverlay.update("Reconnecting…")
+    Thread {
+      Thread.sleep(600)
+      if (!cancelled) runCatching { connect() }
+      reconnecting = false
+    }.also { it.isDaemon = true }.start()
   }
 
   /** Setup carries the system instruction + tools ONCE for the whole session. */
@@ -96,13 +144,22 @@ class ChakaLive(
       "You are Chaka, watching your owner's Android screen live and helping in real time. " +
       "You can SEE the screen (frames stream to you) and you can ACT on it with the provided tools.\n" +
       "GOAL / CONTEXT: ${goal.ifBlank { "Assist with whatever is on screen. Ask what they need." }}\n" +
-      "HOW TO WORK:\n" +
-      "- Call read_screen whenever you need exact, tappable elements — it returns each element's index, label and state. Tapping by index is precise; guessing coordinates is not.\n" +
-      "- Act with the tools rather than describing what you'd do, unless they asked you to guide them.\n" +
-      "- Verify with your own eyes: after acting, the next frames show the result. If it didn't work, say so and try a DIFFERENT approach — never repeat a failed action or reload a page hoping it fixes itself.\n" +
-      "- If a sign-in blocks the goal, sign in (tap Log in / Continue with Google, then the existing account).\n" +
-      "- Keep speech short, warm and natural — you're a person beside them, not a manual. Don't narrate every tap.\n" +
-      "- When the goal is met, say so briefly with the actual result."
+      "\nBE PROACTIVE — THIS IS THE MOST IMPORTANT RULE:\n" +
+      "- Once they give you a task, DO THE WHOLE THING. Keep taking actions, back to back, until it's finished.\n" +
+      "- NEVER ask permission to continue. Never say 'shall I go on?', 'would you like me to…?', 'let me know if you want me to…'. Just do the next step.\n" +
+      "- After EVERY action, immediately call read_screen (a fresh frame also arrives) and take the next action yourself. Do NOT wait to be spoken to. Silence from them means CARRY ON.\n" +
+      "- If a reply/result appears on screen, read it out loud straight away and then continue — don't wait to be asked what it said.\n" +
+      "- Only stop when: the goal is done, they tell you to stop, or you're genuinely blocked. Only ask a question when the answer is truly ambiguous and you cannot reasonably choose (e.g. which of two accounts is theirs).\n" +
+      "- Tell them what you're doing as you go, in a few words — but as narration, not as a request for approval.\n" +
+      "\nTAPPING — you have two ways, use both:\n" +
+      "- read_screen + tap_index is most precise; prefer it when the target is listed.\n" +
+      "- MANY things are NOT in the element list: buttons inside web pages, photos in a gallery grid, canvas/custom UI. If you can SEE it in the frame but read_screen doesn't list it, use tap_at with fractional coordinates (x and y from 0 to 1, measured from the top-left of the screen). NEVER give up and ask them to tap it themselves — estimate the position from the frame and tap_at it. If your first tap misses, adjust the coordinates and try again.\n" +
+      "- long_press_at works the same way for press-and-hold.\n" +
+      "\nOTHER:\n" +
+      "- Verify with your eyes: the next frames show the result. If something didn't work, say so briefly and try a DIFFERENT approach — never repeat a failed action or reload a page hoping it fixes itself.\n" +
+      "- If a sign-in blocks the goal, sign in yourself (tap Log in / Continue with Google, then the existing account).\n" +
+      "- For an incoming call use answer_call / end_call.\n" +
+      "- Keep speech short, warm and natural — you're a person beside them, not a manual."
 
     val decls = JSONArray()
       .put(fn("read_screen", "Read the current screen: every element with its index, label, and whether it's tappable/editable/toggled. Call this before tapping.", JSONObject()))
@@ -117,20 +174,59 @@ class ChakaLive(
       .put(fn("press_button", "Press a system button: back, home, recents, notifications, quick_settings.", props("button", "string", "back|home|recents|notifications|quick_settings"), listOf("button")))
       .put(fn("open_app", "Launch an app by name.", props("app", "string", "App name, e.g. spotify"), listOf("app")))
       .put(fn("navigate", "Open a website URL in the browser.", props("url", "string", "Full URL"), listOf("url")))
+      .put(fn(
+        "tap_at",
+        "Tap anywhere by fractional position (x,y each 0..1 from the top-left). USE THIS for anything you can see in the frame but read_screen does not list — buttons inside web pages, photos in a gallery grid, custom UI. Never ask the user to tap something themselves; estimate from the frame and tap here.",
+        JSONObject()
+          .put("x", JSONObject().put("type", "number").put("description", "0..1 across (left to right)"))
+          .put("y", JSONObject().put("type", "number").put("description", "0..1 down (top to bottom)")),
+        listOf("x", "y")
+      ))
+      .put(fn(
+        "long_press_at",
+        "Press and hold at a fractional position (x,y each 0..1). For context menus, selecting a photo, drag handles.",
+        JSONObject()
+          .put("x", JSONObject().put("type", "number").put("description", "0..1 across"))
+          .put("y", JSONObject().put("type", "number").put("description", "0..1 down")),
+        listOf("x", "y")
+      ))
+      .put(fn("answer_call", "Answer the incoming phone call.", JSONObject()))
+      .put(fn("end_call", "End or reject the current phone call.", JSONObject()))
+
+    val setup = JSONObject()
+      .put("model", "models/$model")
+      .put("systemInstruction", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", sys))))
+      .put("tools", JSONArray().put(JSONObject().put("functionDeclarations", decls)))
+      // Audio+video sessions are capped at ~2 MINUTES without this — a sliding
+      // context window removes the duration limit entirely. This is why Live
+      // Mode was dying mid-task.
+      .put(
+        "contextWindowCompression",
+        JSONObject().put("slidingWindow", JSONObject()).put("triggerTokens", 16000)
+      )
+      // Ask for resumption handles so a dropped connection can be picked up
+      // where it left off instead of starting over.
+      .put("sessionResumption", JSONObject().apply {
+        resumeHandle?.let { put("handle", it) }
+      })
 
     return JSONObject().put(
       "setup",
-      JSONObject()
-        .put("model", "models/$model")
-        .put("systemInstruction", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", sys))))
-        .put("tools", JSONArray().put(JSONObject().put("functionDeclarations", decls)))
+      setup
         .put(
           "generationConfig",
           JSONObject()
             .put("temperature", 0.3)
-            // TEXT for now — we speak it with Android TTS. Native AUDIO output
-            // needs a PCM playback path, which is the next phase.
-            .put("responseModalities", JSONArray().put("TEXT"))
+            // Her actual voice, streamed back as PCM — this is what makes it a
+            // conversation instead of a chat box that happens to talk.
+            .put("responseModalities", JSONArray().put("AUDIO"))
+            .put(
+              "speechConfig",
+              JSONObject().put(
+                "voiceConfig",
+                JSONObject().put("prebuiltVoiceConfig", JSONObject().put("voiceName", "Kore"))
+              )
+            )
         )
     )
   }
@@ -148,10 +244,31 @@ class ChakaLive(
     val msg = runCatching { JSONObject(raw) }.getOrNull() ?: return
 
     if (msg.has("setupComplete")) {
-      Log.i(TAG, "setup complete — streaming frames")
+      Log.i(TAG, "setup complete — starting audio + frames")
       ready = true
-      ChakaGuideOverlay.update("Live — I can see your screen")
+      ChakaGuideOverlay.update("Live — talk to me")
+      // Route audio through the communication path so echo cancellation works.
+      runCatching {
+        val am = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        am.mode = AudioManager.MODE_IN_COMMUNICATION
+      }
+      startPlayer()
+      startMic(ws)
       startFrameLoop(ws)
+      return
+    }
+
+    // Keep the newest resumption token so a reconnect resumes this conversation.
+    msg.optJSONObject("sessionResumptionUpdate")?.let { u ->
+      if (u.optBoolean("resumable", true)) {
+        u.optString("newHandle").takeIf { it.isNotBlank() }?.let { resumeHandle = it }
+      }
+    }
+
+    // The server warns before recycling the connection — get ahead of it.
+    msg.optJSONObject("goAway")?.let { g ->
+      Log.i(TAG, "goAway, timeLeft=${g.optString("timeLeft")}")
+      reconnect("server goAway")
       return
     }
 
@@ -169,22 +286,132 @@ class ChakaLive(
         responses.put(JSONObject().put("id", c.optString("id")).put("name", name).put("response", result))
       }
       ws.send(JSONObject().put("toolResponse", JSONObject().put("functionResponses", responses)).toString())
+      // Push the resulting screen straight back. Without this she'd sit waiting
+      // to be spoken to before looking again — the "she stops after every step
+      // and asks permission" problem. Fresh state = she just keeps going.
+      Thread {
+        Thread.sleep(700)  // let the UI settle after the action
+        if (!cancelled && ready) {
+          captureBlocking()?.let { shot ->
+            runCatching {
+              ws.send(
+                JSONObject().put(
+                  "realtimeInput",
+                  JSONObject().put("video", JSONObject().put("mimeType", "image/jpeg").put("data", shot))
+                ).toString()
+              )
+            }
+          }
+        }
+      }.also { it.isDaemon = true }.start()
       return
     }
 
     msg.optJSONObject("serverContent")?.let { content ->
-      val parts = content.optJSONObject("modelTurn")?.optJSONArray("parts") ?: return@let
-      val sb = StringBuilder()
-      for (i in 0 until parts.length()) {
-        parts.optJSONObject(i)?.optString("text")?.let { if (it.isNotBlank()) sb.append(it) }
+      // Barge-in: the user started talking over her, so drop whatever audio is
+      // still queued and let them lead.
+      if (content.optBoolean("interrupted", false)) {
+        runCatching { player?.pause(); player?.flush(); player?.play() }
+        Log.i(TAG, "interrupted by user")
+        return@let
       }
-      val text = sb.toString().trim()
-      if (text.isNotEmpty() && text != lastSpoken) {
-        lastSpoken = text
-        ChakaGuideOverlay.update(text.take(160))
-        speak(text)
+      val parts = content.optJSONObject("modelTurn")?.optJSONArray("parts") ?: return@let
+      for (i in 0 until parts.length()) {
+        val p = parts.optJSONObject(i) ?: continue
+        p.optJSONObject("inlineData")?.let { inline ->
+          val mime = inline.optString("mimeType")
+          if (mime.startsWith("audio")) {
+            val pcm = runCatching { Base64.decode(inline.optString("data"), Base64.DEFAULT) }.getOrNull()
+            if (pcm != null && pcm.isNotEmpty()) {
+              runCatching { player?.write(pcm, 0, pcm.size) }
+            }
+          }
+        }
+        // Transcripts (when present) just drive the bubble text.
+        p.optString("text").takeIf { it.isNotBlank() }?.let {
+          ChakaGuideOverlay.update(it.take(160))
+        }
       }
     }
+  }
+
+  /** 24kHz PCM playback for her voice. */
+  private fun startPlayer() {
+    val minBuf = AudioTrack.getMinBufferSize(
+      OUT_RATE, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT
+    ).coerceAtLeast(8192)
+    player = AudioTrack.Builder()
+      .setAudioAttributes(
+        AudioAttributes.Builder()
+          // VOICE_COMMUNICATION so the echo canceller can reference her output
+          // and the mic doesn't hear her talking back to herself.
+          .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+          .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+          .build()
+      )
+      .setAudioFormat(
+        AudioFormat.Builder()
+          .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+          .setSampleRate(OUT_RATE)
+          .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+          .build()
+      )
+      .setBufferSizeInBytes(minBuf * 4)
+      .setTransferMode(AudioTrack.MODE_STREAM)
+      .build()
+    player?.play()
+  }
+
+  /** Streams the mic up as 16kHz PCM so she can simply be talked to. */
+  private fun startMic(ws: WebSocket) {
+    if (micThread != null) return
+    val minBuf = AudioRecord.getMinBufferSize(
+      MIC_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
+    ).coerceAtLeast(4096)
+    val rec = try {
+      AudioRecord(
+        MediaRecorder.AudioSource.VOICE_COMMUNICATION,  // built-in echo cancellation
+        MIC_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, minBuf * 2
+      )
+    } catch (e: SecurityException) {
+      Log.e(TAG, "mic permission denied: ${e.message}")
+      ChakaGuideOverlay.update("I need microphone access to listen")
+      return
+    }
+    if (rec.state != AudioRecord.STATE_INITIALIZED) {
+      Log.e(TAG, "AudioRecord failed to initialise")
+      return
+    }
+    recorder = rec
+    if (AcousticEchoCanceler.isAvailable()) {
+      aec = runCatching { AcousticEchoCanceler.create(rec.audioSessionId) }.getOrNull()
+      aec?.enabled = true
+    }
+    rec.startRecording()
+
+    micThread = Thread {
+      // ~100ms per chunk keeps latency low without spamming tiny frames.
+      val buf = ByteArray(3200)
+      while (!cancelled && ready) {
+        val n = try { rec.read(buf, 0, buf.size) } catch (e: Exception) { -1 }
+        if (n <= 0) continue
+        val b64 = Base64.encodeToString(buf.copyOf(n), Base64.NO_WRAP)
+        try {
+          ws.send(
+            JSONObject().put(
+              "realtimeInput",
+              JSONObject().put(
+                "audio",
+                JSONObject().put("mimeType", "audio/pcm;rate=$MIC_RATE").put("data", b64)
+              )
+            ).toString()
+          )
+        } catch (e: Exception) {
+          Log.e(TAG, "mic send failed: ${e.message}")
+          return@Thread
+        }
+      }
+    }.also { it.isDaemon = true; it.start() }
   }
 
   /** Streams screen frames, but only when the screen actually changed — a still
@@ -303,6 +530,22 @@ class ChakaLive(
         }
         JSONObject().put("ok", true)
       }
+      // Fractional coordinates: the escape hatch for everything the tree can't
+      // describe (web buttons, gallery photos, custom UI).
+      "tap_at" -> {
+        val x = (args.optDouble("x", -1.0) * dump.optInt("w")).toInt()
+        val y = (args.optDouble("y", -1.0) * dump.optInt("h")).toInt()
+        if (x < 0 || y < 0) JSONObject().put("ok", false).put("error", "x and y must be 0..1")
+        else { service.tap(x, y); JSONObject().put("ok", true).put("tapped_at", "$x,$y") }
+      }
+      "long_press_at" -> {
+        val x = (args.optDouble("x", -1.0) * dump.optInt("w")).toInt()
+        val y = (args.optDouble("y", -1.0) * dump.optInt("h")).toInt()
+        if (x < 0 || y < 0) JSONObject().put("ok", false).put("error", "x and y must be 0..1")
+        else { service.swipe(x, y, x, y, 650); JSONObject().put("ok", true) }
+      }
+      "answer_call" -> JSONObject().put("ok", service.answerCall())
+      "end_call" -> JSONObject().put("ok", service.endCall())
       "press_button" -> JSONObject().put("ok", service.globalAction(args.optString("button", "back")))
       "open_app" -> {
         val pkg = ChakaOperator.appPackage(args.optString("app"))
@@ -331,27 +574,16 @@ class ChakaLive(
   fun stop() {
     cancelled = true
     ready = false
-    frameThread?.interrupt()
-    frameThread = null
+    frameThread?.interrupt(); frameThread = null
+    micThread?.interrupt(); micThread = null
+    runCatching { recorder?.stop(); recorder?.release() }; recorder = null
+    runCatching { aec?.release() }; aec = null
+    runCatching { player?.pause(); player?.flush(); player?.release() }; player = null
+    runCatching {
+      val am = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+      am.mode = AudioManager.MODE_NORMAL
+    }
     runCatching { socket?.close(1000, "done") }
     socket = null
-    shutdownTts()
-  }
-
-  private fun initTts() {
-    runCatching {
-      tts = TextToSpeech(context) { status ->
-        if (status == TextToSpeech.SUCCESS) tts?.language = Locale.getDefault()
-      }
-    }
-  }
-
-  private fun speak(text: String) {
-    runCatching { tts?.speak(text, TextToSpeech.QUEUE_ADD, null, "chaka-live") }
-  }
-
-  private fun shutdownTts() {
-    runCatching { tts?.stop(); tts?.shutdown() }
-    tts = null
   }
 }

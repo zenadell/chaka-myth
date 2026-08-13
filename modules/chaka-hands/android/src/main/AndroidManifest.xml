@@ -1,6 +1,8 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
   <!-- Lets Chaka install her own updates (downloaded from GitHub Releases). -->
   <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+  <!-- Answer/end calls on request during a live session. -->
+  <uses-permission android:name="android.permission.ANSWER_PHONE_CALLS" />
   <application>
     <!-- Shares the downloaded APK with the system installer via a content:// URI. -->
     <provider

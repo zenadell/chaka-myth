@@ -294,6 +294,47 @@ class ChakaAccessibilityService : AccessibilityService() {
     return out
   }
 
+  /**
+   * Answers an incoming call. Uses TelecomManager where permitted, and falls
+   * back to the accessibility "answer" affordance on the call screen — the
+   * in-call UI often isn't reachable as a normal tappable element.
+   */
+  fun answerCall(): Boolean {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+      val tm = getSystemService(Context.TELECOM_SERVICE) as? android.telecom.TelecomManager
+      val ok = runCatching { tm?.acceptRingingCall(); true }.getOrDefault(false)
+      if (ok) return true
+    }
+    return tapNodeMatching(listOf("answer", "accept", "pick up"))
+  }
+
+  /** Ends/rejects the current call. */
+  fun endCall(): Boolean {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+      val tm = getSystemService(Context.TELECOM_SERVICE) as? android.telecom.TelecomManager
+      val ok = runCatching { tm?.endCall() ?: false }.getOrDefault(false)
+      if (ok) return true
+    }
+    return tapNodeMatching(listOf("end call", "decline", "reject", "hang up"))
+  }
+
+  /** Clicks the first visible node whose label contains one of [words]. */
+  private fun tapNodeMatching(words: List<String>): Boolean {
+    val root = rootInActiveWindow ?: return false
+    fun walk(n: AccessibilityNodeInfo?): Boolean {
+      if (n == null) return false
+      val label = ((n.text?.toString() ?: "") + " " + (n.contentDescription?.toString() ?: "")).lowercase()
+      if (n.isVisibleToUser && words.any { label.contains(it) }) {
+        if (n.isClickable && n.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true
+        val r = Rect(); n.getBoundsInScreen(r)
+        if (r.width() > 0 && r.height() > 0) return tap(r.centerX(), r.centerY())
+      }
+      for (i in 0 until n.childCount) if (walk(n.getChild(i))) return true
+      return false
+    }
+    return walk(root)
+  }
+
   fun globalAction(name: String): Boolean {
     val action = when (name) {
       "back" -> GLOBAL_ACTION_BACK

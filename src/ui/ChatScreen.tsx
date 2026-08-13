@@ -1,3 +1,4 @@
+import * as Hands from "../../modules/chaka-hands";
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
   FlatList,
@@ -13,7 +14,7 @@ import { Feather } from "@expo/vector-icons";
 import * as Haptics from "expo-haptics";
 import Animated, { FadeIn, FadeInDown } from "react-native-reanimated";
 import { useChat, DisplayItem } from "../state/chatStore";
-import { useSettings } from "../state/settings";
+import { LIVE_MODEL, useSettings } from "../state/settings";
 import { MessageBubble } from "./components/MessageBubble";
 import { ToolChip } from "./components/ToolChip";
 import { ConfirmCard } from "./components/ConfirmCard";
@@ -79,6 +80,15 @@ export function ChatScreen() {
       startWakeword(() => {
         if (!mounted) return;
         Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+        // "Hey Chaka" drops straight into a live voice session — that's the
+        // whole point of a wake word. Falls back to dictation if live isn't
+        // available (no Gemini key / older APK).
+        const { geminiKey } = useSettings.getState();
+        if (Hands.canGoLive() && Hands.isEnabled() && geminiKey && !Hands.isLiveRunning()) {
+          Hands.startLive("", geminiKey, LIVE_MODEL).catch(() => beginListening());
+          return;
+        }
+        if (Hands.isLiveRunning()) return; // already listening to them
         beginListening();
       }).then((ok) => mounted && setWakewordOn(ok));
     }
@@ -106,6 +116,13 @@ export function ChatScreen() {
   const onSend = () => {
     const text = draft;
     setDraft("");
+    // While a live session is open it owns the conversation — route typed text
+    // into that same session instead of starting a separate chat turn, which
+    // would answer from a model that can't see the screen.
+    if (Hands.isLiveRunning()) {
+      Hands.sayLive(text);
+      return;
+    }
     sendMessage(text);
   };
 
