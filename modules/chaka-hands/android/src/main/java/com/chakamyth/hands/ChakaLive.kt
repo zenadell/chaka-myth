@@ -71,6 +71,14 @@ class ChakaLive(
   @Volatile private var drives = 0
   @Volatile private var lastDriveSig = ""
   private var driveThread: Thread? = null
+  // Supervisor: the session can die silently — an error payload we don't parse,
+  // or a half-open socket OkHttp never reports. The mic keeps recording into a
+  // dead connection and everything just goes quiet. This watches liveness
+  // independently of the socket callbacks and forces a reconnect.
+  @Volatile private var lastMsgAt = 0L
+  @Volatile private var connectedAt = 0L
+  @Volatile private var attempts = 0
+  private var supervisorThread: Thread? = null
   private var lastGoal = ""
   private var lastKey = ""
   private var lastModel = ""
@@ -94,7 +102,45 @@ class ChakaLive(
 
   fun start(goal: String, apiKey: String, model: String) {
     lastGoal = goal; lastKey = apiKey; lastModel = model
+    startSupervisor()
     connect()
+  }
+
+  /**
+   * Liveness watchdog, modelled on the "wrap the whole session in a retry loop"
+   * pattern. Runs for the life of the session, independent of any socket, so a
+   * connection that dies quietly still gets rebuilt instead of leaving the mic
+   * streaming into nothing.
+   */
+  private fun startSupervisor() {
+    if (supervisorThread != null) return
+    supervisorThread = Thread {
+      while (!cancelled) {
+        try {
+          Thread.sleep(3000)
+          if (cancelled) break
+          if (reconnecting) continue
+          val now = System.currentTimeMillis()
+
+          // Connected, but the server has gone completely quiet.
+          if (ready && lastMsgAt > 0 && now - lastMsgAt > 45000) {
+            Log.w(TAG, "no server message for ${(now - lastMsgAt) / 1000}s — session is dead")
+            reconnect("went quiet")
+            continue
+          }
+          // Socket opened but setup never completed (bad handle, quota, etc).
+          if (!ready && connectedAt > 0 && now - connectedAt > 20000) {
+            Log.w(TAG, "setup never completed after ${(now - connectedAt) / 1000}s")
+            resumeHandle = null  // a stale handle is the usual culprit — start clean
+            reconnect("setup timed out")
+          }
+        } catch (e: InterruptedException) {
+          return@Thread
+        } catch (e: Exception) {
+          Log.e(TAG, "supervisor: ${e.message}")
+        }
+      }
+    }.also { it.isDaemon = true; it.start() }
   }
 
   private fun connect() {
@@ -105,6 +151,8 @@ class ChakaLive(
 
       override fun onOpen(ws: WebSocket, response: Response) {
         Log.i(TAG, "socket open — sending setup (model=$model)")
+        connectedAt = System.currentTimeMillis()
+        lastMsgAt = connectedAt
         ws.send(setupMessage(goal, model).toString())
       }
 
@@ -143,12 +191,23 @@ class ChakaLive(
     driveThread?.interrupt(); driveThread = null
     runCatching { recorder?.stop(); recorder?.release() }; recorder = null
     runCatching { player?.pause(); player?.flush() }
-    Log.i(TAG, "reconnecting ($why) handle=${resumeHandle?.take(12) ?: "none"}")
+    runCatching { socket?.cancel() }  // make sure the dead socket is really gone
+    socket = null
+    connectedAt = 0
+    attempts++
+    // Back off a little when it keeps failing, and after a few tries give up on
+    // the resumption handle in case that's what the server is rejecting.
+    val wait = minOf(600L * attempts, 5000L)
+    if (attempts >= 3) resumeHandle = null
+    Log.i(TAG, "reconnecting ($why) attempt=$attempts wait=${wait}ms handle=${resumeHandle?.take(12) ?: "none"}")
     ChakaGuideOverlay.update("Reconnecting…")
     Thread {
-      Thread.sleep(600)
-      if (!cancelled) runCatching { connect() }
-      reconnecting = false
+      try {
+        Thread.sleep(wait)
+        if (!cancelled) runCatching { connect() }
+      } finally {
+        reconnecting = false  // must always clear, or we'd never retry again
+      }
     }.also { it.isDaemon = true }.start()
   }
 
@@ -273,11 +332,26 @@ class ChakaLive(
     JSONObject().put(name, JSONObject().put("type", type).put("description", desc))
 
   private fun handleServerMessage(ws: WebSocket, raw: String) {
+    lastMsgAt = System.currentTimeMillis()  // proof the session is still alive
     val msg = runCatching { JSONObject(raw) }.getOrNull() ?: return
+
+    // Errors used to be silently ignored, which is how a dead session looked
+    // identical to a quiet one.
+    if (msg.has("error")) {
+      val err = msg.optJSONObject("error")
+      val code = err?.optInt("code") ?: 0
+      val message = err?.optString("message") ?: raw.take(160)
+      Log.e(TAG, "server error $code: $message")
+      ChakaGuideOverlay.update("Live error: ${message.take(120)}")
+      // 401/403 = bad key: retrying just burns quota. Anything else, rebuild.
+      if (code == 401 || code == 403) stop() else reconnect("server error $code")
+      return
+    }
 
     if (msg.has("setupComplete")) {
       Log.i(TAG, "setup complete — starting audio + frames")
       ready = true
+      attempts = 0  // healthy again
       ChakaGuideOverlay.update("Live — talk to me")
       // Route audio through the communication path so echo cancellation works.
       runCatching {
@@ -757,6 +831,7 @@ class ChakaLive(
   fun stop() {
     cancelled = true
     ready = false
+    supervisorThread?.interrupt(); supervisorThread = null
     frameThread?.interrupt(); frameThread = null
     driveThread?.interrupt(); driveThread = null
     micThread?.interrupt(); micThread = null
