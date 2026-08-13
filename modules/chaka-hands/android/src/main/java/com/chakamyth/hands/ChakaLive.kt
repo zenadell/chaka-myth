@@ -74,7 +74,7 @@ class ChakaLive(
   @Volatile private var lastActivityAt = 0L
   @Volatile private var readyAt = 0L
   @Volatile private var drives = 0
-  @Volatile private var lastDriveSig = ""
+  @Volatile private var lastDriveAt = 0L
   private var driveThread: Thread? = null
   // Supervisor: the session can die silently — an error payload we don't parse,
   // or a half-open socket OkHttp never reports. The mic keeps recording into a
@@ -103,6 +103,11 @@ class ChakaLive(
     private const val LIVE_FRAME_WIDTH = 760
     private const val LIVE_FRAME_QUALITY = 55
     private const val MIN_FRAME_GAP_MS = 1500L
+    // Hard floor between drive prods. A screen signature can't be trusted to
+    // rate-limit them: anything animated (a recording timer, a video, a
+    // spinner) changes every frame, so the loop fired four turns in five
+    // seconds and choked the session.
+    private const val MIN_DRIVE_GAP_MS = 12000L
     private const val OUT_RATE = 24000   // model's audio output rate
   }
 
@@ -406,6 +411,8 @@ class ChakaLive(
     if (msg.has("setupComplete")) {
       Log.i(TAG, "setup complete — starting audio + frames")
       ready = true
+      drives = 0
+      lastDriveAt = System.currentTimeMillis()
       readyAt = System.currentTimeMillis()
       lastActivityAt = readyAt
       attempts = 0  // healthy again
@@ -587,13 +594,10 @@ class ChakaLive(
           // actions, and never straight after the user has spoken.
           if (System.currentTimeMillis() - lastActivityAt < 8000) continue
           if (drives >= 4) continue  // stalled on something real — stop pushing
-
-          val dump = runCatching { JSONObject(service.dumpScreen()) }.getOrNull() ?: continue
-          val sig = dump.optJSONArray("els")?.toString()?.hashCode()?.toString() ?: ""
-          // If we already pushed on this exact screen and nothing moved, back off
-          // rather than repeating the same prod.
-          if (sig == lastDriveSig && drives > 0) { drives++; continue }
-          lastDriveSig = sig
+          // Never prod twice in quick succession, whatever the screen is doing.
+          val now2 = System.currentTimeMillis()
+          if (now2 - lastDriveAt < MIN_DRIVE_GAP_MS) continue
+          lastDriveAt = now2
           drives++
           Log.i(TAG, "DRIVE $drives — task open, idle ${(System.currentTimeMillis() - lastActivityAt) / 1000}s")
 
