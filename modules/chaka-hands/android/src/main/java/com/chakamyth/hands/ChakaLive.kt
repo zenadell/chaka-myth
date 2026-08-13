@@ -64,6 +64,13 @@ class ChakaLive(
   @Volatile private var taskActive = false
   @Volatile private var nudges = 0
   private val turnSaid = StringBuilder()
+  // Goal-driven drive loop: keeps her working while a task is open, whether or
+  // not anyone speaks. Live sessions otherwise only advance on conversation
+  // turns, so she'd idle until the user prodded her.
+  @Volatile private var lastToolAt = 0L
+  @Volatile private var drives = 0
+  @Volatile private var lastDriveSig = ""
+  private var driveThread: Thread? = null
   private var lastGoal = ""
   private var lastKey = ""
   private var lastModel = ""
@@ -133,6 +140,7 @@ class ChakaLive(
     // Tear down the audio/frame threads; connect() starts fresh ones on setup.
     micThread?.interrupt(); micThread = null
     frameThread?.interrupt(); frameThread = null
+    driveThread?.interrupt(); driveThread = null
     runCatching { recorder?.stop(); recorder?.release() }; recorder = null
     runCatching { player?.pause(); player?.flush() }
     Log.i(TAG, "reconnecting ($why) handle=${resumeHandle?.take(12) ?: "none"}")
@@ -157,6 +165,7 @@ class ChakaLive(
       "- A task = a chain of tool calls. Keep calling tools back to back until it is finished. Silence from them means CARRY ON.\n" +
       "- NEVER ask permission to continue: no 'shall I go on?', 'would you like me to…?', 'what would you like to do?'. They already told you the task — execute all of it.\n" +
       "- If they had to repeat themselves or tell you to 'do it already', you failed. Never let that happen.\n" +
+      "- A task stays OPEN until you call task_done. While it is open you must keep acting on your own — nobody is going to prompt you. Call task_done the moment the screen proves it's finished.\n" +
       "\nNEVER CLAIM SOMETHING YOU HAVE NOT VERIFIED:\n" +
       "- Do not say an app is open, a photo is tapped, or a message is sent unless the CURRENT screen proves it. Check read_screen or the latest frame first.\n" +
       "- If the screen shows something different from what you expected, say so plainly and fix it. Do not insist it worked.\n" +
@@ -204,6 +213,12 @@ class ChakaLive(
       ))
       .put(fn("answer_call", "Answer the incoming phone call.", JSONObject()))
       .put(fn("end_call", "End or reject the current phone call.", JSONObject()))
+      .put(fn(
+        "task_done",
+        "Call this ONLY when the current task is fully finished and the screen proves it. Until you call this, you are still working and must keep acting.",
+        props("summary", "string", "What was accomplished, in one short sentence"),
+        listOf("summary")
+      ))
 
     val setup = JSONObject()
       .put("model", "models/$model")
@@ -272,6 +287,7 @@ class ChakaLive(
       startPlayer()
       startMic(ws)
       startFrameLoop(ws)
+      startDriveLoop(ws)
       return
     }
 
@@ -298,6 +314,8 @@ class ChakaLive(
         val args = c.optJSONObject("args") ?: JSONObject()
         toolCalledThisTurn = true
         nudges = 0
+        drives = 0
+        lastToolAt = System.currentTimeMillis()
         val result = runCatching { executeTool(name, args) }.getOrElse {
           JSONObject().put("error", it.message ?: "failed")
         }
@@ -432,6 +450,64 @@ class ChakaLive(
         )
       }
     }.also { it.isDaemon = true }.start()
+  }
+
+  /**
+   * The autonomous drive loop — the difference between a chat that happens to
+   * see the screen and an agent that finishes things.
+   *
+   * A Live session only advances on conversation turns, so if she stops acting
+   * nothing wakes her up and the user has to prod her. This ticks independently:
+   * while a task is open (no task_done yet) and she has gone quiet without
+   * acting, it pushes the current screen back with a directive to continue.
+   * Stops pushing when nothing is changing, so it can't nag forever.
+   */
+  private fun startDriveLoop(ws: WebSocket) {
+    if (driveThread != null) return
+    driveThread = Thread {
+      while (!cancelled && ready) {
+        try {
+          Thread.sleep(2500)
+          if (!taskActive) continue
+          // Give her room to work: only step in once she's been idle a while.
+          if (System.currentTimeMillis() - lastToolAt < 5000) continue
+          if (drives >= 4) continue  // stalled on something real — stop pushing
+
+          val dump = runCatching { JSONObject(service.dumpScreen()) }.getOrNull() ?: continue
+          val sig = dump.optJSONArray("els")?.toString()?.hashCode()?.toString() ?: ""
+          // If we already pushed on this exact screen and nothing moved, back off
+          // rather than repeating the same prod.
+          if (sig == lastDriveSig && drives > 0) { drives++; continue }
+          lastDriveSig = sig
+          drives++
+          Log.i(TAG, "DRIVE $drives — task open, idle ${(System.currentTimeMillis() - lastToolAt) / 1000}s")
+
+          captureBlocking()?.let { shot ->
+            ws.send(
+              JSONObject().put(
+                "realtimeInput",
+                JSONObject().put("video", JSONObject().put("mimeType", "image/jpeg").put("data", shot))
+              ).toString()
+            )
+          }
+          ws.send(
+            JSONObject().put(
+              "realtimeInput",
+              JSONObject().put(
+                "text",
+                "[SYSTEM] The task is still open and you have stopped acting. This is the live screen. " +
+                  "Do not reply with words. Either call the next tool to move the task forward, " +
+                  "or call task_done if the screen proves it is finished."
+              )
+            ).toString()
+          )
+        } catch (e: InterruptedException) {
+          return@Thread
+        } catch (e: Exception) {
+          Log.e(TAG, "drive loop: ${e.message}")
+        }
+      }
+    }.also { it.isDaemon = true; it.start() }
   }
 
   /** 24kHz PCM playback for her voice. */
@@ -643,6 +719,14 @@ class ChakaLive(
         if (x < 0 || y < 0) JSONObject().put("ok", false).put("error", "x and y must be 0..1")
         else { service.swipe(x, y, x, y, 650); JSONObject().put("ok", true) }
       }
+      "task_done" -> {
+        // She's declared completion, so the drive loop stops pushing her.
+        taskActive = false
+        drives = 0
+        Log.i(TAG, "task_done: ${args.optString("summary")}")
+        ChakaGuideOverlay.update("✓ ${args.optString("summary").take(140)}")
+        JSONObject().put("ok", true)
+      }
       "answer_call" -> JSONObject().put("ok", service.answerCall())
       "end_call" -> JSONObject().put("ok", service.endCall())
       "press_button" -> JSONObject().put("ok", service.globalAction(args.optString("button", "back")))
@@ -674,6 +758,7 @@ class ChakaLive(
     cancelled = true
     ready = false
     frameThread?.interrupt(); frameThread = null
+    driveThread?.interrupt(); driveThread = null
     micThread?.interrupt(); micThread = null
     runCatching { recorder?.stop(); recorder?.release() }; recorder = null
     runCatching { aec?.release() }; aec = null
