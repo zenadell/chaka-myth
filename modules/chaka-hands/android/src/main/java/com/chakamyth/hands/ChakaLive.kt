@@ -58,6 +58,12 @@ class ChakaLive(
   // a dropped socket resumes the conversation instead of losing the task.
   @Volatile private var resumeHandle: String? = null
   @Volatile private var reconnecting = false
+  // Talk-without-action detection: did this turn actually call a tool, what did
+  // she say, and is there an outstanding task she's supposed to be executing?
+  @Volatile private var toolCalledThisTurn = false
+  @Volatile private var taskActive = false
+  @Volatile private var nudges = 0
+  private val turnSaid = StringBuilder()
   private var lastGoal = ""
   private var lastKey = ""
   private var lastModel = ""
@@ -144,13 +150,19 @@ class ChakaLive(
       "You are Chaka, watching your owner's Android screen live and helping in real time. " +
       "You can SEE the screen (frames stream to you) and you can ACT on it with the provided tools.\n" +
       "GOAL / CONTEXT: ${goal.ifBlank { "Assist with whatever is on screen. Ask what they need." }}\n" +
-      "\nBE PROACTIVE — THIS IS THE MOST IMPORTANT RULE:\n" +
-      "- Once they give you a task, DO THE WHOLE THING. Keep taking actions, back to back, until it's finished.\n" +
-      "- NEVER ask permission to continue. Never say 'shall I go on?', 'would you like me to…?', 'let me know if you want me to…'. Just do the next step.\n" +
-      "- After EVERY action, immediately call read_screen (a fresh frame also arrives) and take the next action yourself. Do NOT wait to be spoken to. Silence from them means CARRY ON.\n" +
-      "- If a reply/result appears on screen, read it out loud straight away and then continue — don't wait to be asked what it said.\n" +
-      "- Only stop when: the goal is done, they tell you to stop, or you're genuinely blocked. Only ask a question when the answer is truly ambiguous and you cannot reasonably choose (e.g. which of two accounts is theirs).\n" +
-      "- Tell them what you're doing as you go, in a few words — but as narration, not as a request for approval.\n" +
+      "\nACT — DO NOT TALK ABOUT ACTING. THIS OVERRIDES EVERYTHING ELSE:\n" +
+      "- Saying something is NOT doing it. Words change nothing on the phone; only tool calls do.\n" +
+      "- NEVER announce an action before performing it. These phrases are FORBIDDEN: 'I'm opening…', 'I'll tap…', 'I will now…', 'let me…', 'give me a second…', 'I'm going to…'. If you are about to say one, CALL THE TOOL INSTEAD.\n" +
+      "- Order is always: call the tool FIRST → see the result → then speak, briefly, about what ALREADY happened (past tense only).\n" +
+      "- A task = a chain of tool calls. Keep calling tools back to back until it is finished. Silence from them means CARRY ON.\n" +
+      "- NEVER ask permission to continue: no 'shall I go on?', 'would you like me to…?', 'what would you like to do?'. They already told you the task — execute all of it.\n" +
+      "- If they had to repeat themselves or tell you to 'do it already', you failed. Never let that happen.\n" +
+      "\nNEVER CLAIM SOMETHING YOU HAVE NOT VERIFIED:\n" +
+      "- Do not say an app is open, a photo is tapped, or a message is sent unless the CURRENT screen proves it. Check read_screen or the latest frame first.\n" +
+      "- If the screen shows something different from what you expected, say so plainly and fix it. Do not insist it worked.\n" +
+      "- Typing is not sending. After typing you MUST tap the send button (or press_enter) and then confirm it actually sent.\n" +
+      "- If a reply appears on screen, read it out straight away and continue — don't wait to be asked what it said.\n" +
+      "- Only stop when the goal is done, they tell you to stop, or you're genuinely blocked. Only ask when it's truly ambiguous and you cannot reasonably choose (e.g. which of two accounts is theirs).\n" +
       "\nTAPPING — you have two ways, use both:\n" +
       "- read_screen + tap_index is most precise; prefer it when the target is listed.\n" +
       "- MANY things are NOT in the element list: buttons inside web pages, photos in a gallery grid, canvas/custom UI. If you can SEE it in the frame but read_screen doesn't list it, use tap_at with fractional coordinates (x and y from 0 to 1, measured from the top-left of the screen). NEVER give up and ask them to tap it themselves — estimate the position from the frame and tap_at it. If your first tap misses, adjust the coordinates and try again.\n" +
@@ -209,6 +221,11 @@ class ChakaLive(
       .put("sessionResumption", JSONObject().apply {
         resumeHandle?.let { put("handle", it) }
       })
+      // Transcripts of both sides. We need HER words to detect the failure mode
+      // where she announces an action ("I'll open the gallery") and never calls
+      // the tool — see checkTurn().
+      .put("outputAudioTranscription", JSONObject())
+      .put("inputAudioTranscription", JSONObject())
 
     return JSONObject().put(
       "setup",
@@ -279,6 +296,8 @@ class ChakaLive(
         val c = calls.optJSONObject(i) ?: continue
         val name = c.optString("name")
         val args = c.optJSONObject("args") ?: JSONObject()
+        toolCalledThisTurn = true
+        nudges = 0
         val result = runCatching { executeTool(name, args) }.getOrElse {
           JSONObject().put("error", it.message ?: "failed")
         }
@@ -315,6 +334,31 @@ class ChakaLive(
         Log.i(TAG, "interrupted by user")
         return@let
       }
+
+      // The user said something → there's a live instruction to execute.
+      content.optJSONObject("inputTranscription")?.optString("text")
+        ?.takeIf { it.isNotBlank() }?.let {
+          taskActive = true
+          nudges = 0
+          Log.i(TAG, "user: $it")
+        }
+
+      // Accumulate what SHE said this turn, so we can tell talk from action.
+      content.optJSONObject("outputTranscription")?.optString("text")
+        ?.takeIf { it.isNotBlank() }?.let { turnSaid.append(it) }
+
+      if (content.optBoolean("turnComplete", false)) {
+        val said = turnSaid.toString().trim()
+        turnSaid.setLength(0)
+        Log.i(TAG, "turnComplete said=\"${said.take(90)}\" tool=$toolCalledThisTurn")
+        if (said.isNotEmpty()) ChakaGuideOverlay.update(said.take(160))
+        val actedThisTurn = toolCalledThisTurn
+        toolCalledThisTurn = false
+        // She finished a turn without touching the phone. If she promised to do
+        // something, push her to actually do it — otherwise the session just
+        // stalls until the user shouts, which is the whole complaint.
+        if (!actedThisTurn && taskActive && promisedAction(said)) checkTurn(ws, said)
+      }
       val parts = content.optJSONObject("modelTurn")?.optJSONArray("parts") ?: return@let
       for (i in 0 until parts.length()) {
         val p = parts.optJSONObject(i) ?: continue
@@ -333,6 +377,61 @@ class ChakaLive(
         }
       }
     }
+  }
+
+  /**
+   * True when she described doing something rather than reporting it done —
+   * "I'll open…", "let me tap…", "I'm going to…". Past tense ("I opened",
+   * "it's open now") is a report, not a promise, so it isn't flagged.
+   */
+  private fun promisedAction(said: String): Boolean {
+    val s = said.lowercase()
+    if (s.isBlank()) return false
+    val promises = listOf(
+      "i'll ", "i will ", "i'm going to", "im going to", "going to ",
+      "let me ", "i'm opening", "im opening", "i'm tapping", "im tapping",
+      "i'm typing", "im typing", "i'm sending", "im sending", "one moment",
+      "give me a", "hold on", "just a sec", "now i", "next i", "i'm about to"
+    )
+    // Asking a question mid-task is the same failure: it stalls instead of acting.
+    val stalls = listOf("would you like", "shall i", "do you want me", "should i")
+    return promises.any { s.contains(it) } || stalls.any { s.contains(it) }
+  }
+
+  /**
+   * She talked instead of acting. Send the live screen back with a blunt
+   * correction so the loop keeps moving without the user having to repeat
+   * themselves. Capped so it can't turn into a nagging loop.
+   */
+  private fun checkTurn(ws: WebSocket, said: String) {
+    if (nudges >= 3) { Log.i(TAG, "nudge cap reached — leaving it to the user"); return }
+    nudges++
+    Thread {
+      Thread.sleep(400)
+      if (cancelled || !ready) return@Thread
+      Log.i(TAG, "NUDGE $nudges — talked without acting: \"${said.take(70)}\"")
+      runCatching {
+        captureBlocking()?.let { shot ->
+          ws.send(
+            JSONObject().put(
+              "realtimeInput",
+              JSONObject().put("video", JSONObject().put("mimeType", "image/jpeg").put("data", shot))
+            ).toString()
+          )
+        }
+        ws.send(
+          JSONObject().put(
+            "realtimeInput",
+            JSONObject().put(
+              "text",
+              "[SYSTEM] You just spoke without calling any tool, so NOTHING happened on the phone. " +
+                "The screen above is the real current state. Do not reply with words. " +
+                "Call the tool that performs the next step RIGHT NOW, then keep calling tools until the task is done."
+            )
+          ).toString()
+        )
+      }
+    }.also { it.isDaemon = true }.start()
   }
 
   /** 24kHz PCM playback for her voice. */
