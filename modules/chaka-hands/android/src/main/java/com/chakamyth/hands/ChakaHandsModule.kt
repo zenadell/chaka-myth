@@ -29,6 +29,7 @@ class ChakaHandsModule : Module() {
   private val opScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
   private var currentOperator: ChakaOperator? = null
   private var currentGuide: ChakaGuide? = null
+  private var currentLive: ChakaLive? = null
 
   override fun definition() = ModuleDefinition {
     Name("ChakaHands")
@@ -224,6 +225,39 @@ class ChakaHandsModule : Module() {
 
     Function("stopGuide") {
       currentGuide?.cancelled = true
+    }
+
+    // Live Mode: one persistent Gemini Live session that watches the screen,
+    // talks, and acts — instead of a fresh request per action.
+    AsyncFunction("startLive") { goal: String, geminiKey: String, model: String, promise: Promise ->
+      val svc = ChakaAccessibilityService.instance
+      if (svc == null) {
+        promise.reject(HandsNotEnabledException())
+      } else {
+        ChakaKeepAliveService.start(context)
+        ChakaGuideOverlay.show(context, "Connecting live…") { currentLive?.stop() }
+        val live = ChakaLive(svc, context)
+        currentLive = live
+        runCatching { live.start(goal, geminiKey, model) }
+          .onSuccess { promise.resolve("started") }
+          .onFailure { promise.reject(CodedException(it.message ?: "live error")) }
+      }
+    }
+
+    Function("stopLive") {
+      currentLive?.stop()
+      currentLive = null
+      ChakaGuideOverlay.hide(context)
+      ChakaKeepAliveService.stop(context)
+    }
+
+    /** Sends a typed/spoken line from the user into the running live session. */
+    Function("sayLive") { text: String ->
+      currentLive?.say(text)
+    }
+
+    Function("isLiveRunning") {
+      currentLive != null
     }
 
     AsyncFunction("screenshot") { promise: Promise ->

@@ -8,6 +8,10 @@ const PREFS_KEY = "chaka.prefs";
 
 export const VISION_MODEL = "gemini-3.1-flash-lite";
 
+// Live API model — must be a Live-capable (bidirectional) model, not a normal
+// request/response one. gemini-3.5-flash-lite etc. will NOT work here.
+export const LIVE_MODEL = "gemini-3.1-flash-live-preview";
+
 export interface Prefs {
   model: string;
   speakReplies: boolean;

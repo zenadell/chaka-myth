@@ -21,6 +21,7 @@ import { manageFile } from "./fileManage";
 import { takePhoto } from "./cameraTools";
 import { look } from "./visionTools";
 import { guideMe } from "./guideTools";
+import { goLive, stopLive } from "./liveTools";
 import { callNumber, setAlarm, setTimer, uninstallApp } from "./phoneTools";
 import { listCalendarEvents, createCalendarEvent } from "./calendarTools";
 import { setVolume } from "./volumeTools";
@@ -65,6 +66,8 @@ export const tools: Tool[] = [
   operateScreen,
   pressButton,
   guideMe,
+  goLive,
+  stopLive,
   // awareness
   notificationDigest,
   // persistent profile memory

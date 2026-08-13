@@ -54,6 +54,12 @@ class ChakaOperator(private val service: ChakaAccessibilityService) {
       "facebook" to "com.facebook.katana"
     )
 
+    /** Resolves a spoken app name (or a raw package id) to a package. */
+    fun appPackage(name: String): String? {
+      val key = name.lowercase().replace(" ", "")
+      return APP_MAP[key] ?: if (name.contains(".")) name else null
+    }
+
     private const val ACTION_MENU = """Action types (ONE per turn):
 - {"type":"tap_index","index":N}  tap element [N] from the list — PREFER THIS when the target is listed
 - {"type":"tap","x":0.5,"y":0.3}  tap a point as FRACTIONS 0..1 (for things NOT in the list)

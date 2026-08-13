@@ -238,3 +238,32 @@ export function installApk(path: string): void {
 export function canSelfUpdate(): boolean {
   return !!Hands && typeof Hands.installApk === "function";
 }
+
+// --- Live Mode (2.4.0+) ----------------------------------------------------
+// One persistent Gemini Live session: watches the screen, talks, and acts.
+
+export function canGoLive(): boolean {
+  return !!Hands && typeof Hands.startLive === "function";
+}
+
+/** Opens the live session. `goal` is optional context ("" = just assist). */
+export async function startLive(
+  goal: string,
+  geminiKey: string,
+  model: string
+): Promise<string> {
+  return Hands.startLive(goal, geminiKey, model);
+}
+
+export function stopLive(): void {
+  Hands?.stopLive?.();
+}
+
+/** Sends a line from the user into the running session. */
+export function sayLive(text: string): void {
+  Hands?.sayLive?.(text);
+}
+
+export function isLiveRunning(): boolean {
+  return !!Hands?.isLiveRunning?.();
+}

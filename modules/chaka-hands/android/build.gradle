@@ -18,4 +18,8 @@ android {
 dependencies {
   // FileProvider, for handing the downloaded update APK to the system installer.
   implementation 'androidx.core:core-ktx:1.13.1'
+  // WebSocket for the Gemini Live API session (must run natively — RN's JS
+  // thread freezes once Chaka is backgrounded, which is exactly when Live Mode
+  // is doing its job).
+  implementation 'com.squareup.okhttp3:okhttp:4.12.0'
 }
