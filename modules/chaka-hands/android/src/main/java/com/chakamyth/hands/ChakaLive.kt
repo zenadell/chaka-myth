@@ -63,6 +63,9 @@ class ChakaLive(
   @Volatile private var toolCalledThisTurn = false
   @Volatile private var taskActive = false
   @Volatile private var nudges = 0
+  // Consecutive completed turns where she took no action at all — used to tell
+  // "idle, needs a push" from "genuinely stuck, stop pushing".
+  @Volatile private var idleTurns = 0
   private val turnSaid = StringBuilder()
   // Goal-driven drive loop: keeps her working while a task is open, whether or
   // not anyone speaks. Live sessions otherwise only advance on conversation
@@ -283,6 +286,9 @@ class ChakaLive(
       "- A tool result is not the end of your work — it's the middle. After each one, immediately do the next thing. Ending your turn with the task unfinished and nothing pending is a failure.\n" +
       "- When you call task_done, SAY what you did and anything the user needs to know. Never finish in silence and make them ask 'are you done?'.\n" +
       "- If the connection drops (they may be on a call), pick straight back up when you return — say you're back and resume any unfinished task.\n" +
+      "- OBSTACLES ARE YOURS TO CLEAR, not theirs. Permission dialogs (Allow / While using the app), cookie or consent banners, ads, 'Not now', update prompts, rating popups — deal with them yourself the instant they appear: accept what the task needs, dismiss or close anything it doesn't. Never stop and stare at a popup waiting for instructions.\n" +
+      "- TYPING ACCURACY: type the EXACT words asked for. After typing, read the field back on screen and confirm it matches; if it's wrong, clear it and retype before searching. Searching for the wrong text wastes far more time than checking.\n" +
+      "- Finish the whole intent, not the setup for it. 'Play X' means the song is PLAYING, not that you searched for it. 'Message X' means sent. Keep going until the real outcome is on screen.\n" +
       "\nNEVER CLAIM SOMETHING YOU HAVE NOT VERIFIED:\n" +
       "- Do not say an app is open, a photo is tapped, or a message is sent unless the CURRENT screen proves it. Check read_screen or the latest frame first.\n" +
       "- If the screen shows something different from what you expected, say so plainly and fix it. Do not insist it worked.\n" +
@@ -511,6 +517,7 @@ class ChakaLive(
           taskActive = true
           nudges = 0
           drives = 0
+          idleTurns = 0
           // Critical: give her room to answer. Without this the drive loop fired
           // a [SYSTEM] turn on top of the user's turn and the session wedged.
           lastActivityAt = System.currentTimeMillis()
@@ -532,7 +539,14 @@ class ChakaLive(
         // She finished a turn without touching the phone. If she promised to do
         // something, push her to actually do it — otherwise the session just
         // stalls until the user shouts, which is the whole complaint.
-        if (!actedThisTurn && taskActive && promisedAction(said)) checkTurn(ws, said)
+        if (!actedThisTurn && taskActive && promisedAction(said)) {
+          checkTurn(ws, said)
+        } else if (taskActive) {
+          // The heart of it: she ends her turn after ONE action and yields, so
+          // every step used to cost the user an 8s wait or a shout. A turn
+          // ending with the task still open is the trigger to carry straight on.
+          autoContinue(ws, actedThisTurn)
+        }
       }
       val parts = content.optJSONObject("modelTurn")?.optJSONArray("parts") ?: return@let
       for (i in 0 until parts.length()) {
@@ -552,6 +566,34 @@ class ChakaLive(
         }
       }
     }
+  }
+
+  /**
+   * Carries the task forward the moment a turn ends, instead of leaving the
+   * user to say "continue" after every single action.
+   *
+   * One continue per completed turn — it can't burst, because each continue
+   * produces exactly one more turn. If several turns pass with no tool call at
+   * all she's genuinely stuck rather than merely idle, so it stands down and
+   * lets the slower drive loop take over.
+   */
+  private fun autoContinue(ws: WebSocket, actedThisTurn: Boolean) {
+    if (actedThisTurn) idleTurns = 0 else idleTurns++
+    if (idleTurns >= 3) {
+      Log.i(TAG, "auto-continue standing down after $idleTurns turns with no action")
+      return
+    }
+    Thread {
+      Thread.sleep(600)  // let the screen settle after the last action
+      if (cancelled || !ready || !taskActive) return@Thread
+      sendFrame(ws)
+      sendText(
+        ws,
+        "[SYSTEM] Task still open. Continue NOW with the next action — do not wait to be told. " +
+          "Handle anything in the way yourself (permission dialogs, ads, popups: accept what the task needs, dismiss what it doesn't). " +
+          "When it is genuinely finished, call task_done and say what you did."
+      )
+    }.also { it.isDaemon = true }.start()
   }
 
   /**
