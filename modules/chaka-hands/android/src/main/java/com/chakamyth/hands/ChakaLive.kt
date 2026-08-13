@@ -68,6 +68,11 @@ class ChakaLive(
   // not anyone speaks. Live sessions otherwise only advance on conversation
   // turns, so she'd idle until the user prodded her.
   @Volatile private var lastToolAt = 0L
+  // Any sign of life: a tool call, a finished turn, or the user speaking. The
+  // drive loop waits on THIS, so it can't cut in while she's mid-reply or a
+  // second after the user has spoken.
+  @Volatile private var lastActivityAt = 0L
+  @Volatile private var readyAt = 0L
   @Volatile private var drives = 0
   @Volatile private var lastDriveSig = ""
   private var driveThread: Thread? = null
@@ -182,10 +187,19 @@ class ChakaLive(
         // 1007 (invalid argument) / 1008 (policy) mean the request itself is
         // being rejected — a bad key or exhausted Live quota. Reconnecting just
         // hammers the API and burns more of it, so stop and say so plainly.
+        // 1007/1008 = the request itself was rejected. Don't hammer, but don't
+        // give up either — on a phone that can't be touched, "stopped forever"
+        // is the one outcome we can't accept. Clear any resumption handle and
+        // come back with a clean session after a pause.
         if (code == 1007 || code == 1008) {
-          Log.e(TAG, "fatal close $code — not retrying: $reason")
-          ChakaGuideOverlay.update("Live unavailable: $reason (check the Gemini key / Live quota)")
-          stop()
+          Log.e(TAG, "rejected ($code): $reason — clean restart in 30s")
+          ChakaGuideOverlay.update("Reconnecting in 30s… ($reason)")
+          resumeHandle = null
+          attempts = 0
+          Thread {
+            Thread.sleep(30000)
+            if (!cancelled) reconnect("clean restart after $code")
+          }.also { it.isDaemon = true }.start()
           return
         }
         if (!cancelled) reconnect("session ended") else stop()
@@ -212,10 +226,18 @@ class ChakaLive(
     socket = null
     connectedAt = 0
     attempts++
-    // Back off a little when it keeps failing, and after a few tries give up on
-    // the resumption handle in case that's what the server is rejecting.
-    val wait = minOf(600L * attempts, 5000L)
-    if (attempts >= 3) resumeHandle = null
+    // A session that dies almost immediately after coming up is the signature of
+    // a resumption handle the server won't honour — it accepts setup, then goes
+    // quiet or resets. Reusing it just reproduces the failure, so throw it away.
+    val diedFast = readyAt > 0 && System.currentTimeMillis() - readyAt < 20000
+    if (diedFast || attempts >= 2) {
+      if (resumeHandle != null) Log.i(TAG, "dropping resumption handle (diedFast=$diedFast)")
+      resumeHandle = null
+    }
+    readyAt = 0
+    // Never give up. This has to survive unattended on a phone whose screen
+    // can't be touched, so it keeps retrying with a capped backoff forever.
+    val wait = minOf(800L * attempts, 10000L)
     Log.i(TAG, "reconnecting ($why) attempt=$attempts wait=${wait}ms handle=${resumeHandle?.take(12) ?: "none"}")
     ChakaGuideOverlay.update("Reconnecting…")
     Thread {
@@ -384,6 +406,8 @@ class ChakaLive(
     if (msg.has("setupComplete")) {
       Log.i(TAG, "setup complete — starting audio + frames")
       ready = true
+      readyAt = System.currentTimeMillis()
+      lastActivityAt = readyAt
       attempts = 0  // healthy again
       ChakaGuideOverlay.update("Live — talk to me")
       // Route audio through the communication path so echo cancellation works.
@@ -423,6 +447,7 @@ class ChakaLive(
         nudges = 0
         drives = 0
         lastToolAt = System.currentTimeMillis()
+        lastActivityAt = lastToolAt
         val result = runCatching { executeTool(name, args) }.getOrElse {
           JSONObject().put("error", it.message ?: "failed")
         }
@@ -454,6 +479,10 @@ class ChakaLive(
         ?.takeIf { it.isNotBlank() }?.let {
           taskActive = true
           nudges = 0
+          drives = 0
+          // Critical: give her room to answer. Without this the drive loop fired
+          // a [SYSTEM] turn on top of the user's turn and the session wedged.
+          lastActivityAt = System.currentTimeMillis()
           Log.i(TAG, "user: $it")
         }
 
@@ -468,6 +497,7 @@ class ChakaLive(
         if (said.isNotEmpty()) ChakaGuideOverlay.update(said.take(160))
         val actedThisTurn = toolCalledThisTurn
         toolCalledThisTurn = false
+        lastActivityAt = System.currentTimeMillis()
         // She finished a turn without touching the phone. If she promised to do
         // something, push her to actually do it — otherwise the session just
         // stalls until the user shouts, which is the whole complaint.
@@ -553,8 +583,9 @@ class ChakaLive(
         try {
           Thread.sleep(1500)
           if (!taskActive) continue
-          // Give her room to work: only step in once she's been idle a while.
-          if (System.currentTimeMillis() - lastToolAt < 5000) continue
+          // Only step in once she's genuinely stalled — not between her own
+          // actions, and never straight after the user has spoken.
+          if (System.currentTimeMillis() - lastActivityAt < 8000) continue
           if (drives >= 4) continue  // stalled on something real — stop pushing
 
           val dump = runCatching { JSONObject(service.dumpScreen()) }.getOrNull() ?: continue
@@ -564,7 +595,7 @@ class ChakaLive(
           if (sig == lastDriveSig && drives > 0) { drives++; continue }
           lastDriveSig = sig
           drives++
-          Log.i(TAG, "DRIVE $drives — task open, idle ${(System.currentTimeMillis() - lastToolAt) / 1000}s")
+          Log.i(TAG, "DRIVE $drives — task open, idle ${(System.currentTimeMillis() - lastActivityAt) / 1000}s")
 
           sendFrame(ws, force = true)
           sendText(
