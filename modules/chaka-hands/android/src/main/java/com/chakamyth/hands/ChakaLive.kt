@@ -128,6 +128,13 @@ class ChakaLive(
   @Volatile private var interruptedThisTurn = false
   // What she predicted the current action would do, and whether the last action
   // actually verified — step_done is refused until something has been checked.
+  // Provably-false-claim detection. Gemini will state it looked at the screen,
+  // or that it performed an action, without having called the tool at all. The
+  // native side knows the truth, so the claim can be checked rather than
+  // trusted - the user hit this repeatedly ("she says the camera is on when it
+  // is off, three times before it actually happens").
+  @Volatile private var lastRealLookAt = 0L
+  @Volatile private var lastScreenReadAt = 0L
   @Volatile private var pendingExpect = ""
   @Volatile private var lastVerified = false
   @Volatile private var consecutiveBlocks = 0
@@ -350,6 +357,7 @@ class ChakaLive(
       "- If the connection drops (they may be on a call), pick straight back up when you return — say you're back and resume any unfinished task.\n" +
       "- OBSTACLES ARE YOURS TO CLEAR, not theirs. Permission dialogs (Allow / While using the app), cookie or consent banners, ads, 'Not now', update prompts, rating popups — deal with them yourself the instant they appear: accept what the task needs, dismiss or close anything it doesn't. Never stop and stare at a popup waiting for instructions.\n" +
       "- SWIPE MEANS CONTENT, NOT FINGER. 'down' reveals what is FURTHER DOWN the page; 'up' goes back toward the TOP. Never swipe to reach the app drawer or notifications — use open_app_drawer or press_button instead, so you can't land in the wrong place.\n" +
+      "\nYOU CANNOT FAKE PERCEPTION. The system knows exactly which tools you called. If you say you can see the screen without having called look_at_screen or read_screen, or say you did something without calling the tool, you WILL be caught and corrected in front of the user. Describing a screen you did not look at is inventing it — you have no idea what is there until you call the tool. Look first, speak second.\n" +
       "\nHOW YOU WORK — LOOK, ACT, CHECK. This is the loop, every step, without exception:\n" +
       "  1. KNOW WHERE YOU ARE. Read the screen (or look_at_screen if the element list is thin or you are in a browser). Never act on a screen you have not examined this turn.\n" +
       "  2. ACT, AND SAY WHAT YOU EXPECT. Every action takes an 'expect' — what the screen should look like afterwards. Be specific and concrete ('the Connections screen opens', 'the field reads golden brown'), because it is compared against the real screen.\n" +
@@ -692,6 +700,20 @@ class ChakaLive(
         turnSaid.setLength(0)
         Log.i(TAG, "turnComplete said=\"${said.take(90)}\" tool=$toolCalledThisTurn")
         if (said.isNotEmpty()) ChakaGuideOverlay.update(said.take(160))
+
+        // Before anything else: did she just claim something untrue?
+        catchFalseClaim(said, toolCalledThisTurn)?.let { correction ->
+          val wasVision = correction.contains("look_at_screen")
+          if (wasVision) pendingLook = true   // give her the real screen
+          turnSaid.setLength(0)
+          toolCalledThisTurn = false
+          interruptedThisTurn = false
+          Thread {
+            Thread.sleep(300)
+            if (!cancelled && ready) sendText(ws, correction)
+          }.also { it.isDaemon = true }.start()
+          return@let
+        }
         val actedThisTurn = toolCalledThisTurn
         val wasInterrupted = interruptedThisTurn
         interruptedThisTurn = false
@@ -776,6 +798,45 @@ class ChakaLive(
    * "I'll open…", "let me tap…", "I'm going to…". Past tense ("I opened",
    * "it's open now") is a report, not a promise, so it isn't flagged.
    */
+  /**
+   * Catches a claim the native side can disprove: saying she looked at the
+   * screen when no perception tool ran, or reporting an action she never took.
+   * Returns the correction to send, or null when the claim checks out.
+   */
+  private fun catchFalseClaim(said: String, actedThisTurn: Boolean): String? {
+    val s = said.lowercase()
+    if (s.isBlank()) return null
+    val now = System.currentTimeMillis()
+
+    val claimsVision = listOf(
+      "i can see", "i see ", "looking at", "i'm looking", "im looking", "i've looked",
+      "ive looked", "i looked", "on your screen i", "the screen shows", "i can view",
+      "i'm viewing", "camera is on", "turned on the camera", "i can observe"
+    ).any { s.contains(it) }
+    val perceivedRecently =
+      now - lastRealLookAt < 15000 || now - lastScreenReadAt < 15000
+    if (claimsVision && !perceivedRecently) {
+      Log.w(TAG, "FALSE CLAIM (vision): \"${said.take(80)}\"")
+      return "[SYSTEM] You just told the user you could see the screen, but you did NOT call look_at_screen or " +
+        "read_screen — so you saw nothing and were describing something you imagined. Never do this. " +
+        "A real screenshot follows: look at it, then correct what you told them."
+    }
+
+    val claimsDone = listOf(
+      "i've tapped", "ive tapped", "i tapped", "i've opened", "ive opened", "i opened",
+      "i've sent", "ive sent", "i sent", "i've typed", "ive typed", "i typed",
+      "i've turned on", "i turned on", "i've created", "i created", "i've deleted",
+      "i deleted", "i've saved", "i saved", "done!", "that's done"
+    ).any { s.contains(it) }
+    if (claimsDone && !actedThisTurn) {
+      Log.w(TAG, "FALSE CLAIM (action): \"${said.take(80)}\"")
+      return "[SYSTEM] You told the user you did something, but you called NO tool this turn — so nothing happened " +
+        "on the phone. Saying it is not doing it. Either perform the action now with the proper tool, or tell them " +
+        "honestly that it has not been done."
+    }
+    return null
+  }
+
   private fun promisedAction(said: String): Boolean {
     val s = said.lowercase()
     if (s.isBlank()) return false
@@ -1371,6 +1432,7 @@ class ChakaLive(
 
     return when (name) {
       "read_screen" -> {
+        lastScreenReadAt = System.currentTimeMillis()
         val els = dump.optJSONArray("els") ?: JSONArray()
         val sb = StringBuilder()
         for (i in 0 until els.length()) {
@@ -1579,6 +1641,7 @@ class ChakaLive(
         }
         lastLookSig = nowSig
         lastLookAt = System.currentTimeMillis()
+        lastRealLookAt = lastLookAt
         pendingLook = true
         JSONObject()
           .put("ok", true)
