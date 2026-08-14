@@ -133,6 +133,10 @@ class ChakaLive(
   // native side knows the truth, so the claim can be checked rather than
   // trusted - the user hit this repeatedly ("she says the camera is on when it
   // is off, three times before it actually happens").
+  // A correction the user speaks mid-task must land BEFORE the next action.
+  // She was tapping "Continue with Google" a second after being told to go
+  // back, then obeying five seconds later.
+  @Volatile private var pendingUserWord = ""
   @Volatile private var lastRealLookAt = 0L
   @Volatile private var lastScreenReadAt = 0L
   @Volatile private var pendingExpect = ""
@@ -654,7 +658,10 @@ class ChakaLive(
             runCatching { player?.pause(); player?.flush(); player?.play() }  // cut her off mid-sentence
             Log.w(TAG, "HARD STOP heard: \"$heard\"")
             ChakaGuideOverlay.update("⏸ Stopped")
+            pendingUserWord = ""
           } else if (words >= 3) {
+            // Hold their words so the very next action has to reckon with them.
+            pendingUserWord = heard
             // Only a real sentence starts work. Stray words the mic caught from
             // the room were kicking off tasks nobody asked for.
             halted = false
@@ -1442,6 +1449,27 @@ class ChakaLive(
   }
 
   private fun executeTool(name: String, args: JSONObject): JSONObject {
+    // The user has just said something and she is about to act on the old
+    // intention. Make her read it first — one interruption per utterance.
+    val fresh = pendingUserWord
+    if (fresh.isNotEmpty() && name !in setOf("read_screen", "look_at_screen", "read_clipboard")) {
+      pendingUserWord = ""
+      Log.i(TAG, "holding '$name' — user just said: \"${fresh.take(60)}\"")
+      return JSONObject()
+        .put("ok", false)
+        .put("user_just_said", fresh)
+        .put(
+          "error",
+          "STOP - the user spoke while you were mid-task and you were about to act on the OLD intention."
+        )
+        .put(
+          "do_now",
+          "What they just said takes priority over whatever you were doing. If it changes the goal, change what you " +
+            "are doing. If it corrects a mistake, fix that. If they told you to go back or undo, do that FIRST. " +
+            "Only carry on with the previous plan if their words clearly don't affect it."
+        )
+    }
+
     // Whatever she predicted this action would do, held for the check afterwards.
     args.optString("expect").takeIf { it.isNotBlank() }?.let { pendingExpect = it }
 
