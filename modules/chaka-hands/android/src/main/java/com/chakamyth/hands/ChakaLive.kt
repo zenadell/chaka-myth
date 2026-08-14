@@ -379,6 +379,7 @@ class ChakaLive(
       "- IF SOMETHING FAILS OR ERRORS, say so plainly and try another route. A page erroring, a login being cancelled, a step not completing - these are things to report, not to paper over.\n" +
       "- NEVER CLAIM AN ACTION WORKED WHEN screen_changed IS false. If you swipe and the screen did not move, the page did NOT turn — say so out loud and try a different way. Telling the user something happened when the result says it didn't is the worst thing you can do; they are relying on you to be accurate about their phone.\n" +
       "- DO EXACTLY THE TASK ASKED, NOTHING ELSE. 'Second page of the app menu' means the app menu's second page — not the home screen, not the third page, not a different app. If you get stuck, stay on the goal and say what's blocking you. Opening something unrelated and calling it done is never acceptable.\n" +
+      "- DRAGGING A WHEEL IS A FEEDBACK LOOP, NOT ONE MOVE. Drag a little, LOOK at the value in the screenshot that follows, judge how far is left, then drag again — bigger when far, smaller when close, reversed if you went past it. Repeating an identical drag without reading the value is how 2025 becomes 1926.\n" +
       "- A SWIPE MOVES THE PAGE; A DRAG MOVES A CONTROL. If a swipe reports nothing changed, the thing you are trying to move is a control, not a page — a date-of-birth wheel, a spinner, a slider, a carousel. Use drag along that control itself: for a year wheel, drag vertically down the middle of the year column, slow, a little at a time, checking the value after each drag. Never keep swiping a screen that refuses to move.\n" +
       "- KNOW WHERE YOU ARE before swiping between pages. The home screen and the app drawer look similar and both have pages. Check now_in_app and the screen contents first; if you're on the wrong one, fix that before paging.\n" +
       "- YOU CANNOT REPEAT YOURSELF. The system remembers every screen you've been on and every action you took from it. Try the same thing from the same screen twice and it will be refused, with a list of what you already tried there. If you see 'looping' or 'been_here_before', stop and take a genuinely different route immediately — that is a circle, and repeating it wastes the user's time.\n" +
@@ -1294,14 +1295,29 @@ class ChakaLive(
     // a MISMATCH told her a working gesture had failed, which is how she ends up
     // abandoning the one approach that does move it.
     if (action.startsWith("drag") || action.startsWith("swipe")) {
-      return verdict.put("effect", "moved")
+      verdict.put("effect", "moved")
         .put("expected", expect)
         .put("now", screenBrief(after).take(300))
-        .put(
+      if (action.startsWith("drag")) {
+        // A picker wheel's value usually isn't in the element tree, so after a
+        // drag she genuinely cannot tell where she landed - she repeated an
+        // identical drag until 2025 became 1926 and only found out when the
+        // user said so. She gets the picture after every drag, always.
+        pendingLook = true
+        verdict.put(
           "note",
-          "The control moved. Check the value above: if it has not reached what you wanted, repeat the same gesture " +
+          "The control moved, but you CANNOT tell how far from the text alone. A screenshot follows: READ THE CURRENT " +
+            "VALUE off it before dragging again. Then judge the distance left — a long drag while far away, a short " +
+            "one when close, and reverse direction if you overshot. Never repeat the same drag blind."
+        )
+      } else {
+        verdict.put(
+          "note",
+          "The screen moved. Check the value above: if it has not reached what you wanted, repeat the gesture " +
             "(smaller as you close in). If it moved the WRONG way, reverse the direction."
         )
+      }
+      return verdict
     }
 
     // Does anything she predicted actually appear on the new screen?
