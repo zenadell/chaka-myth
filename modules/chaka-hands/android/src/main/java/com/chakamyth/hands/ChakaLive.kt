@@ -375,6 +375,7 @@ class ChakaLive(
       "- IF SOMETHING FAILS OR ERRORS, say so plainly and try another route. A page erroring, a login being cancelled, a step not completing - these are things to report, not to paper over.\n" +
       "- NEVER CLAIM AN ACTION WORKED WHEN screen_changed IS false. If you swipe and the screen did not move, the page did NOT turn — say so out loud and try a different way. Telling the user something happened when the result says it didn't is the worst thing you can do; they are relying on you to be accurate about their phone.\n" +
       "- DO EXACTLY THE TASK ASKED, NOTHING ELSE. 'Second page of the app menu' means the app menu's second page — not the home screen, not the third page, not a different app. If you get stuck, stay on the goal and say what's blocking you. Opening something unrelated and calling it done is never acceptable.\n" +
+      "- A SWIPE MOVES THE PAGE; A DRAG MOVES A CONTROL. If a swipe reports nothing changed, the thing you are trying to move is a control, not a page — a date-of-birth wheel, a spinner, a slider, a carousel. Use drag along that control itself: for a year wheel, drag vertically down the middle of the year column, slow, a little at a time, checking the value after each drag. Never keep swiping a screen that refuses to move.\n" +
       "- KNOW WHERE YOU ARE before swiping between pages. The home screen and the app drawer look similar and both have pages. Check now_in_app and the screen contents first; if you're on the wrong one, fix that before paging.\n" +
       "- YOU CANNOT REPEAT YOURSELF. The system remembers every screen you've been on and every action you took from it. Try the same thing from the same screen twice and it will be refused, with a list of what you already tried there. If you see 'looping' or 'been_here_before', stop and take a genuinely different route immediately — that is a circle, and repeating it wastes the user's time.\n" +
       "- EVERY ACTION TELLS YOU WHAT IT DID. Each result includes now_in_app, screen_changed and screen_now. READ THEM. If screen_changed is false, that move failed — change approach, never repeat it. If now_in_app isn't where you meant to be, you went the wrong way: press back and correct it immediately.\n" +
@@ -448,6 +449,18 @@ class ChakaLive(
         "open_app_drawer",
         "Open the app drawer (the full list of installed apps). Use this instead of swiping when you need to find, launch, uninstall or inspect an app. Goes to the home screen first, so it works from anywhere.",
         JSONObject()
+      ))
+      .put(fn(
+        "drag",
+        "Drag from one point to another, both as fractions 0..1. USE THIS for anything a whole-screen swipe cannot move: date/time picker wheels, spinners, sliders, carousels, seek bars, reordering. A swipe scrolls the whole page; a drag works inside one control. For a picker wheel, drag vertically along the middle of THAT column (e.g. from 0.5,0.55 to 0.5,0.35 to move it up).",
+        JSONObject()
+          .put("from_x", JSONObject().put("type", "number").put("description", "0..1 across"))
+          .put("from_y", JSONObject().put("type", "number").put("description", "0..1 down"))
+          .put("to_x", JSONObject().put("type", "number").put("description", "0..1 across"))
+          .put("to_y", JSONObject().put("type", "number").put("description", "0..1 down"))
+          .put("slow", JSONObject().put("type", "boolean").put("description", "true for a precise, controlled drag (pickers); false/omit for a flick"))
+          .put("expect", JSONObject().put("type", "string").put("description", "REQUIRED. What should change, e.g. 'the year shows 1967'.")),
+        listOf("from_x", "from_y", "to_x", "to_y", "expect")
       ))
       .put(fn("answer_call", "Answer the incoming phone call.", JSONObject()))
       .put(fn("end_call", "End or reject the current phone call.", JSONObject()))
