@@ -108,6 +108,11 @@ class ChakaLive(
   // only a second call - made after seeing it - is accepted. She had been
   // declaring victory with no evidence at all.
   @Volatile private var awaitingDoneProof = false
+  // Guards against looking at the same screen over and over. Each injected
+  // image ends a turn, which makes her respond - and if she responds by asking
+  // to look again, that is a self-sustaining loop that also drowns out the user.
+  @Volatile private var lastLookSig = ""
+  @Volatile private var lastLookAt = 0L
   // What the user has said recently. The destructive-action rail consults this
   // so it blocks a runaway agent without blocking the user's own instruction.
   private val recentSpeech = StringBuilder()
@@ -584,11 +589,19 @@ class ChakaLive(
             Thread.sleep(450)  // let the screen settle
             if (!cancelled && ready) {
               captureBlocking()?.let { shot ->
-                val prompt = if (awaitingDoneProof)
-                  "This is the REAL current screen. Check every part of what the user asked is visibly complete here. " +
-                    "If it is, call task_done again to confirm. If it is not, say what is actually on screen and keep working."
-                else
-                  "This is the current screen. Look carefully, then continue the task with your next action."
+                val prompt = when {
+                  awaitingDoneProof ->
+                    "This is the REAL current screen. Check every part of what the user asked is visibly complete here. " +
+                      "If it is, call task_done again to confirm. If it is not, say what is actually on screen and keep working."
+                  taskActive ->
+                    "This is the current screen. Look carefully, then take your next ACTION on the task. " +
+                      "You already have the picture — do not ask to look again."
+                  // With no task running, describing it IS the job. Telling her to
+                  // "continue the task" here is what started her looping: the image
+                  // ends a turn, she responds by looking again, forever.
+                  else ->
+                    "This is the current screen. Tell the user briefly what you can see. Do not call look_at_screen again."
+                }
                 Log.i(TAG, "injecting screenshot (${shot.length} b64)")
                 sendImage(ws, shot, prompt)
               }
@@ -1301,6 +1314,22 @@ class ChakaLive(
           )
       }
       "look_at_screen" -> {
+        val nowSig = sig(dump)
+        val since = System.currentTimeMillis() - lastLookAt
+        if (nowSig == lastLookSig && since < 15000) {
+          Log.w(TAG, "refusing repeat look at an unchanged screen (${since}ms)")
+          return JSONObject()
+            .put("ok", false)
+            .put(
+              "error",
+              "You have ALREADY seen this exact screen and nothing on it has changed. Looking again shows the same " +
+                "picture. ACT on what you saw - tap something, type, or go somewhere - or if you are unsure what the " +
+                "user wants, ask them."
+            )
+            .put("screen_now", screenBrief(dump))
+        }
+        lastLookSig = nowSig
+        lastLookAt = System.currentTimeMillis()
         pendingLook = true
         JSONObject()
           .put("ok", true)
