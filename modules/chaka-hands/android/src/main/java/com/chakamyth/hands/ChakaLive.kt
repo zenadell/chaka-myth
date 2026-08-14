@@ -104,6 +104,9 @@ class ChakaLive(
   // Repeat detection for actions, so a wrong move can't be repeated blindly.
   @Volatile private var lastActionSig = ""
   @Volatile private var sameActionRepeats = 0
+  // What the user has said recently. The destructive-action rail consults this
+  // so it blocks a runaway agent without blocking the user's own instruction.
+  private val recentSpeech = StringBuilder()
   private var supervisorThread: Thread? = null
   private var lastGoal = ""
   private var lastKey = ""
@@ -550,6 +553,10 @@ class ChakaLive(
           // Critical: give her room to answer. Without this the drive loop fired
           // a [SYSTEM] turn on top of the user's turn and the session wedged.
           lastActivityAt = System.currentTimeMillis()
+          synchronized(recentSpeech) {
+            recentSpeech.append(' ').append(it.lowercase())
+            if (recentSpeech.length > 600) recentSpeech.delete(0, recentSpeech.length - 600)
+          }
           Log.i(TAG, "user: $it")
         }
 
@@ -618,7 +625,7 @@ class ChakaLive(
     // Even while she's acting, a task can't legitimately need dozens of pushes.
     // Past this she's lost, and continuing to prod makes her flail.
     autoContinues++
-    if (autoContinues > 12) {
+    if (autoContinues > 30) {
       Log.w(TAG, "auto-continue cap hit ($autoContinues) — standing down, asking for direction")
       taskActive = false
       sendText(
@@ -937,12 +944,30 @@ class ChakaLive(
    */
   private fun isDestructive(label: String): Boolean {
     val l = label.lowercase().trim()
-    return listOf(
+    val hit = listOf(
       "force stop", "uninstall", "clear data", "clear storage", "clear cache",
       "factory reset", "reset all settings", "erase all data", "delete account",
       "remove account", "format", "wipe", "disable", "deactivate", "log out",
       "sign out", "delete all"
-    ).any { l.contains(it) }
+    ).firstOrNull { l.contains(it) } ?: return false
+
+    // The rail exists to stop a runaway agent, not to overrule the user. If
+    // they asked for this in their own words, it's their phone and their call —
+    // blocking it just sent her hunting for a worse route (it once blocked the
+    // literal "uninstall Redbox TV" she'd been told to do).
+    val asked = synchronized(recentSpeech) { recentSpeech.toString() }
+    val synonyms = when (hit) {
+      "uninstall" -> listOf("uninstall", "remove", "delete")
+      "force stop" -> listOf("force stop", "stop the app", "kill")
+      "clear data", "clear storage", "clear cache" -> listOf("clear", "wipe")
+      "log out", "sign out" -> listOf("log out", "sign out", "logout")
+      else -> listOf(hit)
+    }
+    if (synonyms.any { asked.contains(it) }) {
+      Log.i(TAG, "allowing \"$label\" — the user asked for it")
+      return false
+    }
+    return true
   }
 
   /** Compact description of the screen, for action feedback. */
