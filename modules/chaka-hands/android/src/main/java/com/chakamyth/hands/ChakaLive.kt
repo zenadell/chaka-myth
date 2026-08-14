@@ -1277,7 +1277,7 @@ class ChakaLive(
    * majority of GUI-agent failures precisely because nothing ever compares the
    * outcome to the intention.
    */
-  private fun verifyEffect(expect: String, after: JSONObject, changed: Boolean): JSONObject {
+  private fun verifyEffect(expect: String, after: JSONObject, changed: Boolean, action: String = ""): JSONObject {
     val verdict = JSONObject()
     if (expect.isBlank()) {
       return verdict.put("effect", "not_declared")
@@ -1289,6 +1289,21 @@ class ChakaLive(
         .put("actual", "nothing changed on screen at all")
         .put("do_now", "That action had NO effect. Do not repeat it. Look at the screen and take a different route.")
     }
+    // Continuous controls move by degrees. A wheel dragged from 2025 towards
+    // 1969 is working even though the target isn't on screen yet - calling that
+    // a MISMATCH told her a working gesture had failed, which is how she ends up
+    // abandoning the one approach that does move it.
+    if (action.startsWith("drag") || action.startsWith("swipe")) {
+      return verdict.put("effect", "moved")
+        .put("expected", expect)
+        .put("now", screenBrief(after).take(300))
+        .put(
+          "note",
+          "The control moved. Check the value above: if it has not reached what you wanted, repeat the same gesture " +
+            "(smaller as you close in). If it moved the WRONG way, reverse the direction."
+        )
+    }
+
     // Does anything she predicted actually appear on the new screen?
     val haystack = screenBrief(after).lowercase() + " " + after.optString("pkg").lowercase()
     val keywords = expect.lowercase()
@@ -1319,7 +1334,7 @@ class ChakaLive(
     consecutiveBlocks = 0
 
     // Compare the outcome against what she said she expected.
-    val verdict = verifyEffect(pendingExpect, after, changed)
+    val verdict = verifyEffect(pendingExpect, after, changed, action)
     pendingExpect = ""
     if (verdict.optString("effect") == "MISMATCH") {
       result.put("verification", verdict)
