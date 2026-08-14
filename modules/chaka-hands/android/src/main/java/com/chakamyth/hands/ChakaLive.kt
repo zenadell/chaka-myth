@@ -126,6 +126,10 @@ class ChakaLive(
   // A turn that was cut off isn't a turn she chose to end - pushing her to
   // "continue" after one just makes her act without having finished thinking.
   @Volatile private var interruptedThisTurn = false
+  // What she predicted the current action would do, and whether the last action
+  // actually verified — step_done is refused until something has been checked.
+  @Volatile private var pendingExpect = ""
+  @Volatile private var lastVerified = false
   @Volatile private var consecutiveBlocks = 0
   @Volatile private var lastLookSig = ""
   @Volatile private var lastLookAt = 0L
@@ -346,6 +350,12 @@ class ChakaLive(
       "- If the connection drops (they may be on a call), pick straight back up when you return — say you're back and resume any unfinished task.\n" +
       "- OBSTACLES ARE YOURS TO CLEAR, not theirs. Permission dialogs (Allow / While using the app), cookie or consent banners, ads, 'Not now', update prompts, rating popups — deal with them yourself the instant they appear: accept what the task needs, dismiss or close anything it doesn't. Never stop and stare at a popup waiting for instructions.\n" +
       "- SWIPE MEANS CONTENT, NOT FINGER. 'down' reveals what is FURTHER DOWN the page; 'up' goes back toward the TOP. Never swipe to reach the app drawer or notifications — use open_app_drawer or press_button instead, so you can't land in the wrong place.\n" +
+      "\nHOW YOU WORK — LOOK, ACT, CHECK. This is the loop, every step, without exception:\n" +
+      "  1. KNOW WHERE YOU ARE. Read the screen (or look_at_screen if the element list is thin or you are in a browser). Never act on a screen you have not examined this turn.\n" +
+      "  2. ACT, AND SAY WHAT YOU EXPECT. Every action takes an 'expect' — what the screen should look like afterwards. Be specific and concrete ('the Connections screen opens', 'the field reads golden brown'), because it is compared against the real screen.\n" +
+      "  3. CHECK WHAT ACTUALLY HAPPENED. The result carries a 'verification'. 'as_expected' means carry on. 'MISMATCH' means you were WRONG about what that action would do — a screenshot follows, look at it, work out where you really are, and fix THAT step. Never continue as though it worked.\n" +
+      "  4. Only then call step_done. It is refused if nothing was verified.\n" +
+      "This loop is what makes you accurate. Skipping the check is how you end up insisting something happened when it did not.\n" +
       "- PLAN BEFORE YOU ACT. Anything with more than one step: call set_plan first with the goal and the ordered steps. The plan is saved and handed back to you after EVERY action, so check it each time — it is what keeps you on the objective when something unexpected happens.\n" +
       "- WORK THE PLAN ONE STEP AT A TIME: look if you need to, act, then CHECK the result (screen_changed / screen_now / your own eyes) before calling step_done. If a step went wrong, fix that step — do not skip ahead and do not abandon the plan to go do something else.\n" +
       "- A MISTAKE IS NOT A REASON TO CHANGE THE GOAL. If you tap the wrong thing, go back and get that step right. Never quietly switch to a different app or a different objective; the user asked for one thing.\n" +
@@ -381,8 +391,14 @@ class ChakaLive(
 
     val decls = JSONArray()
       .put(fn("read_screen", "Read the current screen: every element with its index, label, and whether it's tappable/editable/toggled. Call this before tapping.", JSONObject()))
-      .put(fn("tap_index", "Tap the element with this index (from read_screen).", props("index", "integer", "Element index"), listOf("index")))
-      .put(fn("type_text", "Type into the focused field. Tap the field first.", props("text", "string", "Text to type"), listOf("text")))
+      .put(fn("tap_index", "Tap the element with this index (from read_screen).", JSONObject()
+        .put("index", JSONObject().put("type", "integer").put("description", "Element index"))
+        .put("expect", JSONObject().put("type", "string").put("description", "REQUIRED. What you expect to see after this tap, e.g. 'the Settings screen opens' or 'the search box gets focus'. It is checked against the real screen.")),
+        listOf("index", "expect")))
+      .put(fn("type_text", "Type into the focused field. Tap the field first.", JSONObject()
+        .put("text", JSONObject().put("type", "string").put("description", "Text to type"))
+        .put("expect", JSONObject().put("type", "string").put("description", "REQUIRED. What the screen should show afterwards, e.g. 'the field contains golden brown'.")),
+        listOf("text", "expect")))
       .put(fn("press_enter", "Press the keyboard enter/search key.", JSONObject()))
       .put(fn(
         "read_clipboard",
@@ -392,8 +408,9 @@ class ChakaLive(
       .put(fn("swipe", "Scroll the screen. direction: down (reveal content further down), up, left, right. amount: tiny|normal|long.",
         JSONObject()
           .put("direction", JSONObject().put("type", "string").put("description", "down|up|left|right"))
-          .put("amount", JSONObject().put("type", "string").put("description", "tiny|normal|long")),
-        listOf("direction")))
+          .put("amount", JSONObject().put("type", "string").put("description", "tiny|normal|long"))
+          .put("expect", JSONObject().put("type", "string").put("description", "REQUIRED. What should come into view, e.g. 'the second page of the app drawer'.")),
+        listOf("direction", "expect")))
       .put(fn("press_button", "Press a system button: back, home, recents, notifications, quick_settings.", props("button", "string", "back|home|recents|notifications|quick_settings"), listOf("button")))
       .put(fn("open_app", "Launch an app by name.", props("app", "string", "App name, e.g. spotify"), listOf("app")))
       .put(fn("navigate", "Open a website URL in the browser.", props("url", "string", "Full URL"), listOf("url")))
@@ -402,8 +419,9 @@ class ChakaLive(
         "Tap anywhere by fractional position (x,y each 0..1 from the top-left). USE THIS for anything you can see in the frame but read_screen does not list — buttons inside web pages, photos in a gallery grid, custom UI. Never ask the user to tap something themselves; estimate from the frame and tap here.",
         JSONObject()
           .put("x", JSONObject().put("type", "number").put("description", "0..1 across (left to right)"))
-          .put("y", JSONObject().put("type", "number").put("description", "0..1 down (top to bottom)")),
-        listOf("x", "y")
+          .put("y", JSONObject().put("type", "number").put("description", "0..1 down (top to bottom)"))
+          .put("expect", JSONObject().put("type", "string").put("description", "REQUIRED. What you expect to happen when you tap there.")),
+        listOf("x", "y", "expect")
       ))
       .put(fn(
         "long_press_at",
@@ -1151,6 +1169,48 @@ class ChakaLive(
     }.joinToString("\n")
   }
 
+  /**
+   * Action-effect verification, done on-device so it costs nothing in latency.
+   *
+   * She states what she EXPECTS an action to produce; afterwards the real screen
+   * is compared against it. This is the check the ACL "Don't Act Blindly" work
+   * identifies as the missing piece - repeated ineffective actions are the
+   * majority of GUI-agent failures precisely because nothing ever compares the
+   * outcome to the intention.
+   */
+  private fun verifyEffect(expect: String, after: JSONObject, changed: Boolean): JSONObject {
+    val verdict = JSONObject()
+    if (expect.isBlank()) {
+      return verdict.put("effect", "not_declared")
+        .put("note", "You did not say what you expected. Always pass 'expect' so the result can be checked against it.")
+    }
+    if (!changed) {
+      return verdict.put("effect", "MISMATCH")
+        .put("expected", expect)
+        .put("actual", "nothing changed on screen at all")
+        .put("do_now", "That action had NO effect. Do not repeat it. Look at the screen and take a different route.")
+    }
+    // Does anything she predicted actually appear on the new screen?
+    val haystack = screenBrief(after).lowercase() + " " + after.optString("pkg").lowercase()
+    val keywords = expect.lowercase()
+      .split(Regex("[^a-z0-9]+"))
+      .filter { it.length > 3 && it !in setOf("the","this","that","with","should","will","open","opens","screen","page","show","shows","appear","appears") }
+    val hits = keywords.count { haystack.contains(it) }
+    return if (keywords.isEmpty() || hits > 0) {
+      verdict.put("effect", "as_expected")
+    } else {
+      verdict.put("effect", "MISMATCH")
+        .put("expected", expect)
+        .put("actual", screenBrief(after).take(400))
+        .put(
+          "do_now",
+          "The screen changed, but NOT into what you expected. Something else happened - possibly you hit the wrong " +
+            "thing. A screenshot follows: look at it, work out where you actually are, and FIX THIS STEP before " +
+            "moving on. Do not carry on as if it worked, and do not abandon the plan."
+        )
+    }
+  }
+
   private fun withOutcome(before: JSONObject, action: String, result: JSONObject): JSONObject {
     Thread.sleep(550)  // let the UI settle
     val after = runCatching { JSONObject(service.dumpScreen()) }.getOrNull() ?: return result
@@ -1158,6 +1218,28 @@ class ChakaLive(
     val app = after.optString("pkg")
 
     consecutiveBlocks = 0
+
+    // Compare the outcome against what she said she expected.
+    val verdict = verifyEffect(pendingExpect, after, changed)
+    pendingExpect = ""
+    if (verdict.optString("effect") == "MISMATCH") {
+      result.put("verification", verdict)
+      lastVerified = false
+      // She is demonstrably wrong about the screen, so stop guessing and look.
+      pendingLook = true
+      Log.w(TAG, "EFFECT MISMATCH after '$action'")
+    } else {
+      result.put("verification", verdict)
+      lastVerified = verdict.optString("effect") == "as_expected"
+    }
+
+    // A thin element list means the tree can't describe this screen (web pages,
+    // custom UI). Hand her the picture rather than letting her guess blind.
+    if ((after.optJSONArray("els")?.length() ?: 0) < 4) {
+      pendingLook = true
+      result.put("note", "This screen exposes almost no elements — a screenshot follows, work from it with tap_at.")
+    }
+
     if (plan.isNotEmpty()) result.put("your_plan", planText())
     if (action == lastActionSig && !changed) sameActionRepeats++ else sameActionRepeats = 0
     lastActionSig = action
@@ -1268,6 +1350,9 @@ class ChakaLive(
   }
 
   private fun executeTool(name: String, args: JSONObject): JSONObject {
+    // Whatever she predicted this action would do, held for the check afterwards.
+    args.optString("expect").takeIf { it.isNotBlank() }?.let { pendingExpect = it }
+
     // Nothing touches the phone while halted, whatever the model decides.
     if (halted && name !in setOf("read_screen", "look_at_screen", "read_clipboard", "task_done")) {
       Log.w(TAG, "refused '$name' — halted by the user")
@@ -1355,6 +1440,19 @@ class ChakaLive(
           .put("next", "Now do step 1. Look first if you need to, act, then check it worked before calling step_done.")
       }
       "step_done" -> {
+        if (!lastVerified) {
+          pendingLook = true
+          return JSONObject()
+            .put("ok", false)
+            .put("error", "You have not verified this step. The last action either failed its check or was never checked.")
+            .put(
+              "do_now",
+              "A screenshot follows. Look at it and confirm this step is REALLY done. If it is, act once more with a " +
+                "clear 'expect' and then call step_done. If it is not, fix the step first."
+            )
+            .put("your_plan", planText())
+        }
+        lastVerified = false
         if (planStep < plan.size) planStep++
         Log.i(TAG, "step_done -> now on step ${planStep + 1}/${plan.size}")
         JSONObject().put("ok", true).put("plan", planText())
