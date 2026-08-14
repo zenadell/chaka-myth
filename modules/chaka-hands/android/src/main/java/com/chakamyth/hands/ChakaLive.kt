@@ -94,6 +94,13 @@ class ChakaLive(
   @Volatile private var attempts = 0
   // True when the failure was "no network at all" (e.g. a call suspended data).
   @Volatile private var offline = false
+  // True while her audio is playing. The mic is muted during that window, which
+  // is how a working implementation avoids hearing itself — far safer than
+  // desensitising VAD, which stopped turns committing at all.
+  @Volatile private var speaking = false
+  // Set when she calls look_at_screen; the image is injected right after that
+  // tool's response rather than streamed continuously.
+  @Volatile private var pendingLook = false
   private var supervisorThread: Thread? = null
   private var lastGoal = ""
   private var lastKey = ""
@@ -339,6 +346,11 @@ class ChakaLive(
           .put("y", JSONObject().put("type", "number").put("description", "0..1 down")),
         listOf("x", "y")
       ))
+      .put(fn(
+        "look_at_screen",
+        "Take a picture of the screen and look at it with your own eyes. Use this when read_screen isn't enough — web pages, photos, galleries, games, custom or image-based UI, or when you need to judge how something LOOKS. The image arrives in the next message.",
+        JSONObject()
+      ))
       .put(fn("answer_call", "Answer the incoming phone call.", JSONObject()))
       .put(fn("end_call", "End or reject the current phone call.", JSONObject()))
       .put(fn(
@@ -459,7 +471,6 @@ class ChakaLive(
       }
       startPlayer()
       startMic(ws)
-      startFrameLoop(ws)
       startDriveLoop(ws)
       return
     }
@@ -497,13 +508,15 @@ class ChakaLive(
         responses.put(JSONObject().put("id", c.optString("id")).put("name", name).put("response", result))
       }
       ws.send(JSONObject().put("toolResponse", JSONObject().put("functionResponses", responses)).toString())
-      // Push the resulting screen straight back. Without this she'd sit waiting
-      // to be spoken to before looking again — the "she stops after every step
-      // and asks permission" problem. Fresh state = she just keeps going.
-      Thread {
-        Thread.sleep(700)  // let the UI settle after the action
-        if (!cancelled && ready) sendFrame(ws)
-      }.also { it.isDaemon = true }.start()
+      // A screenshot is only sent when she explicitly asked to look, and it
+      // must arrive AFTER the tool response it belongs to.
+      if (pendingLook) {
+        pendingLook = false
+        Thread {
+          Thread.sleep(500)  // let the screen settle first
+          if (!cancelled && ready) sendFrame(ws, force = true)
+        }.also { it.isDaemon = true }.start()
+      }
       return
     }
 
@@ -535,6 +548,8 @@ class ChakaLive(
         ?.takeIf { it.isNotBlank() }?.let { turnSaid.append(it) }
 
       if (content.optBoolean("turnComplete", false)) {
+        // Her audio is queued in the player; unmute the mic once it has drained.
+        Thread { Thread.sleep(700); speaking = false }.also { it.isDaemon = true }.start()
         val said = turnSaid.toString().trim()
         turnSaid.setLength(0)
         Log.i(TAG, "turnComplete said=\"${said.take(90)}\" tool=$toolCalledThisTurn")
@@ -562,6 +577,7 @@ class ChakaLive(
           if (mime.startsWith("audio")) {
             val pcm = runCatching { Base64.decode(inline.optString("data"), Base64.DEFAULT) }.getOrNull()
             if (pcm != null && pcm.isNotEmpty()) {
+              speaking = true
               runCatching { player?.write(pcm, 0, pcm.size) }
             }
           }
@@ -605,7 +621,6 @@ class ChakaLive(
     Thread {
       Thread.sleep(600)  // let the screen settle after the last action
       if (cancelled || !ready || !taskActive) return@Thread
-      sendFrame(ws)
       sendText(
         ws,
         "[SYSTEM] Task still open. Continue NOW with the next action — do not wait to be told. " +
@@ -690,7 +705,6 @@ class ChakaLive(
           drives++
           Log.i(TAG, "DRIVE $drives — task open, idle ${(System.currentTimeMillis() - lastActivityAt) / 1000}s")
 
-          sendFrame(ws, force = true)
           sendText(
             ws,
             "[SYSTEM] The task is still open and you have stopped acting. This is the live screen. " +
@@ -766,6 +780,9 @@ class ChakaLive(
       while (!cancelled && ready) {
         val n = try { rec.read(buf, 0, buf.size) } catch (e: Exception) { -1 }
         if (n <= 0) continue
+        // Don't stream our own output back in — that's what kept "interrupting"
+        // her mid-sentence and leaving turns empty.
+        if (speaking) continue
         val b64 = Base64.encodeToString(buf.copyOf(n), Base64.NO_WRAP)
         try {
           ws.send(
@@ -1018,6 +1035,12 @@ class ChakaLive(
             "next",
             "Now SAY OUT LOUD, in one short natural sentence, what you finished and anything the user needs to know from the screen. Do not stay silent."
           )
+      }
+      "look_at_screen" -> {
+        pendingLook = true
+        JSONObject()
+          .put("ok", true)
+          .put("note", "Screenshot is being sent now and arrives in the NEXT message. Look at it, then continue the task.")
       }
       "answer_call" -> JSONObject().put("ok", service.answerCall())
       "end_call" -> JSONObject().put("ok", service.endCall())
