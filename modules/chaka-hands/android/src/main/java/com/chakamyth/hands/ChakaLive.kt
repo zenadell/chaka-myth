@@ -177,7 +177,7 @@ class ChakaLive(
           // this is dead air the user is sitting through, and on a phone that
           // can't be touched it's the only thing standing between them and a
           // working assistant.
-          if (ready && lastMsgAt > 0 && now - lastMsgAt > 20000) {
+          if (ready && lastMsgAt > 0 && now - lastMsgAt > 40000) {
             Log.w(TAG, "no server message for ${(now - lastMsgAt) / 1000}s — session is dead")
             reconnect("went quiet")
             continue
@@ -540,15 +540,7 @@ class ChakaLive(
         responses.put(JSONObject().put("id", c.optString("id")).put("name", name).put("response", result))
       }
       ws.send(JSONObject().put("toolResponse", JSONObject().put("functionResponses", responses)).toString())
-      // A screenshot is only sent when she explicitly asked to look, and it
-      // must arrive AFTER the tool response it belongs to.
-      if (pendingLook) {
-        pendingLook = false
-        Thread {
-          Thread.sleep(500)  // let the screen settle first
-          if (!cancelled && ready) sendFrame(ws, force = true)
-        }.also { it.isDaemon = true }.start()
-      }
+
       return
     }
 
@@ -585,6 +577,27 @@ class ChakaLive(
         ?.takeIf { it.isNotBlank() }?.let { turnSaid.append(it) }
 
       if (content.optBoolean("turnComplete", false)) {
+        // She asked to look — deliver the picture now that her turn has ended.
+        if (pendingLook) {
+          pendingLook = false
+          Thread {
+            Thread.sleep(450)  // let the screen settle
+            if (!cancelled && ready) {
+              captureBlocking()?.let { shot ->
+                val prompt = if (awaitingDoneProof)
+                  "This is the REAL current screen. Check every part of what the user asked is visibly complete here. " +
+                    "If it is, call task_done again to confirm. If it is not, say what is actually on screen and keep working."
+                else
+                  "This is the current screen. Look carefully, then continue the task with your next action."
+                Log.i(TAG, "injecting screenshot (${shot.length} b64)")
+                sendImage(ws, shot, prompt)
+              }
+            }
+          }.also { it.isDaemon = true }.start()
+          turnSaid.setLength(0)
+          toolCalledThisTurn = false
+          return@let   // the image IS the continuation; don't also nudge
+        }
         // Her audio is queued in the player; unmute the mic once it has drained.
         Thread { Thread.sleep(700); speaking = false }.also { it.isDaemon = true }.start()
         val said = turnSaid.toString().trim()
@@ -897,6 +910,38 @@ class ChakaLive(
               JSONObject()
                 .put("role", "user")
                 .put("parts", JSONArray().put(JSONObject().put("text", text)))
+            )
+          )
+          .put("turnComplete", true)
+      ).toString()
+    )
+  }.getOrDefault(false)
+
+  /**
+   * Sends the screenshot the way a content turn must be sent: clientContent
+   * with inline_data AND a text prompt, turn_complete. A bare realtimeInput
+   * video frame mid-turn gave her nothing to act on — she'd call
+   * look_at_screen twice and then sit there having seen nothing.
+   */
+  private fun sendImage(ws: WebSocket, b64: String, prompt: String): Boolean = runCatching {
+    ws.send(
+      JSONObject().put(
+        "clientContent",
+        JSONObject()
+          .put(
+            "turns",
+            JSONArray().put(
+              JSONObject().put("role", "user").put(
+                "parts",
+                JSONArray()
+                  .put(
+                    JSONObject().put(
+                      "inline_data",
+                      JSONObject().put("mime_type", "image/jpeg").put("data", b64)
+                    )
+                  )
+                  .put(JSONObject().put("text", prompt))
+              )
             )
           )
           .put("turnComplete", true)
