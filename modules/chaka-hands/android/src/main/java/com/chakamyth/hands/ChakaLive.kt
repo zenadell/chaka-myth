@@ -104,6 +104,10 @@ class ChakaLive(
   // Repeat detection for actions, so a wrong move can't be repeated blindly.
   @Volatile private var lastActionSig = ""
   @Volatile private var sameActionRepeats = 0
+  // task_done is gated: the first call triggers a look at the real screen, and
+  // only a second call - made after seeing it - is accepted. She had been
+  // declaring victory with no evidence at all.
+  @Volatile private var awaitingDoneProof = false
   // What the user has said recently. The destructive-action rail consults this
   // so it blocks a runaway agent without blocking the user's own instruction.
   private val recentSpeech = StringBuilder()
@@ -312,6 +316,10 @@ class ChakaLive(
       "- If the connection drops (they may be on a call), pick straight back up when you return — say you're back and resume any unfinished task.\n" +
       "- OBSTACLES ARE YOURS TO CLEAR, not theirs. Permission dialogs (Allow / While using the app), cookie or consent banners, ads, 'Not now', update prompts, rating popups — deal with them yourself the instant they appear: accept what the task needs, dismiss or close anything it doesn't. Never stop and stare at a popup waiting for instructions.\n" +
       "- SWIPE MEANS CONTENT, NOT FINGER. 'down' reveals what is FURTHER DOWN the page; 'up' goes back toward the TOP. Never swipe to reach the app drawer or notifications — use open_app_drawer or press_button instead, so you can't land in the wrong place.\n" +
+      "- USE YOUR EYES BEFORE SAYING ANYTHING IS DONE. You can SEE — call look_at_screen and actually check. Never say an account is created, a page is open, a message is sent or a task is finished unless you have just looked and can see it. Saying it does not make it so.\n" +
+      "- WEB PAGES NEED YOUR EYES. Inside Chrome or any browser the element list is often nearly empty even though the page is full of buttons. If read_screen comes back thin or blank and you're in a browser, call look_at_screen and work from the picture with tap_at.\n" +
+      "- A REQUEST WITH SEVERAL PARTS IS NOT DONE UNTIL EVERY PART IS. 'Create an account AND get me the API key' is two things. Track them, finish both, and if you only managed one, say exactly which and why.\n" +
+      "- IF SOMETHING FAILS OR ERRORS, say so plainly and try another route. A page erroring, a login being cancelled, a step not completing - these are things to report, not to paper over.\n" +
       "- NEVER CLAIM AN ACTION WORKED WHEN screen_changed IS false. If you swipe and the screen did not move, the page did NOT turn — say so out loud and try a different way. Telling the user something happened when the result says it didn't is the worst thing you can do; they are relying on you to be accurate about their phone.\n" +
       "- DO EXACTLY THE TASK ASKED, NOTHING ELSE. 'Second page of the app menu' means the app menu's second page — not the home screen, not the third page, not a different app. If you get stuck, stay on the goal and say what's blocking you. Opening something unrelated and calling it done is never acceptable.\n" +
       "- KNOW WHERE YOU ARE before swiping between pages. The home screen and the app drawer look similar and both have pages. Check now_in_app and the screen contents first; if you're on the wrong one, fix that before paging.\n" +
@@ -561,6 +569,7 @@ class ChakaLive(
           drives = 0
           idleTurns = 0
           autoContinues = 0
+          awaitingDoneProof = false
           // Critical: give her room to answer. Without this the drive loop fired
           // a [SYSTEM] turn on top of the user's turn and the session wedged.
           lastActivityAt = System.currentTimeMillis()
@@ -1210,7 +1219,28 @@ class ChakaLive(
         else { service.swipe(x, y, x, y, 650); JSONObject().put("ok", true) }
       }
       "task_done" -> {
-        // She's declared completion, so the drive loop stops pushing her.
+        if (!awaitingDoneProof) {
+          // Don't take her word for it. Send the actual screen and make her
+          // check every part of the request against it first.
+          awaitingDoneProof = true
+          pendingLook = true
+          val asked = synchronized(recentSpeech) { recentSpeech.toString().takeLast(280).trim() }
+          return JSONObject()
+            .put("ok", false)
+            .put("verify_first", true)
+            .put("now_in_app", dump.optString("pkg"))
+            .put("screen_now", screenBrief(dump))
+            .put("the_user_asked", asked.ifEmpty { "(see the conversation)" })
+            .put(
+              "instruction",
+              "NOT accepted yet. A screenshot of the real screen follows in the next message. LOOK at it and check " +
+                "EVERY part of what the user asked is actually visible as complete — a request with two parts is not " +
+                "done when only one is. If the screen truly proves it, call task_done again and it will be accepted. " +
+                "If it does not, say what still needs doing and carry on working."
+            )
+        }
+        // Second call, made after seeing the screen — accept it.
+        awaitingDoneProof = false
         taskActive = false
         drives = 0
         autoContinues = 0
