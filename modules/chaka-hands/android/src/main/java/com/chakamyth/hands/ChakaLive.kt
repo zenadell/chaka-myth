@@ -111,6 +111,9 @@ class ChakaLive(
   // Guards against looking at the same screen over and over. Each injected
   // image ends a turn, which makes her respond - and if she responds by asking
   // to look again, that is a self-sustaining loop that also drowns out the user.
+  // Consecutive refused actions. A block she ignores is worse than no block -
+  // she hammered the same blocked tap eleven times in a row.
+  @Volatile private var consecutiveBlocks = 0
   @Volatile private var lastLookSig = ""
   @Volatile private var lastLookAt = 0L
   // What the user has said recently. The destructive-action rail consults this
@@ -321,6 +324,7 @@ class ChakaLive(
       "- If the connection drops (they may be on a call), pick straight back up when you return — say you're back and resume any unfinished task.\n" +
       "- OBSTACLES ARE YOURS TO CLEAR, not theirs. Permission dialogs (Allow / While using the app), cookie or consent banners, ads, 'Not now', update prompts, rating popups — deal with them yourself the instant they appear: accept what the task needs, dismiss or close anything it doesn't. Never stop and stare at a popup waiting for instructions.\n" +
       "- SWIPE MEANS CONTENT, NOT FINGER. 'down' reveals what is FURTHER DOWN the page; 'up' goes back toward the TOP. Never swipe to reach the app drawer or notifications — use open_app_drawer or press_button instead, so you can't land in the wrong place.\n" +
+      "- COPYING IS NOT VERIFIED UNTIL YOU READ IT BACK. After tapping any Copy button, call read_clipboard before you paste. Copy buttons very often grab the label next to a value rather than the value itself, and pasting a name where a key should be is silent and useless.\n" +
       "- USE YOUR EYES BEFORE SAYING ANYTHING IS DONE. You can SEE — call look_at_screen and actually check. Never say an account is created, a page is open, a message is sent or a task is finished unless you have just looked and can see it. Saying it does not make it so.\n" +
       "- WEB PAGES NEED YOUR EYES. Inside Chrome or any browser the element list is often nearly empty even though the page is full of buttons. If read_screen comes back thin or blank and you're in a browser, call look_at_screen and work from the picture with tap_at.\n" +
       "- A REQUEST WITH SEVERAL PARTS IS NOT DONE UNTIL EVERY PART IS. 'Create an account AND get me the API key' is two things. Track them, finish both, and if you only managed one, say exactly which and why.\n" +
@@ -354,6 +358,11 @@ class ChakaLive(
       .put(fn("tap_index", "Tap the element with this index (from read_screen).", props("index", "integer", "Element index"), listOf("index")))
       .put(fn("type_text", "Type into the focused field. Tap the field first.", props("text", "string", "Text to type"), listOf("text")))
       .put(fn("press_enter", "Press the keyboard enter/search key.", JSONObject()))
+      .put(fn(
+        "read_clipboard",
+        "Read what is currently on the clipboard. ALWAYS call this after tapping a Copy button and before pasting, to confirm you copied the right thing — copy buttons often grab a label instead of the value.",
+        JSONObject()
+      ))
       .put(fn("swipe", "Scroll the screen. direction: down (reveal content further down), up, left, right. amount: tiny|normal|long.",
         JSONObject()
           .put("direction", JSONObject().put("type", "string").put("description", "down|up|left|right"))
@@ -1083,6 +1092,7 @@ class ChakaLive(
     val changed = sig(after) != sig(before)
     val app = after.optString("pkg")
 
+    consecutiveBlocks = 0
     if (action == lastActionSig && !changed) sameActionRepeats++ else sameActionRepeats = 0
     lastActionSig = action
     recordAction(sig(before), action, sig(after))
@@ -1138,7 +1148,31 @@ class ChakaLive(
     if (times >= 2) {
       val tried = triedFromState[state]?.joinToString(", ") ?: "(none recorded)"
       val visits = stateVisits[state] ?: 0
-      Log.w(TAG, "LOOP BLOCKED: '$action' already tried $times times from this screen (seen ${visits}x)")
+      consecutiveBlocks++
+      Log.w(TAG, "LOOP BLOCKED: '$action' already tried $times times from this screen (seen ${visits}x, block #$consecutiveBlocks)")
+
+      // She can ignore a refusal indefinitely, so escalate: stop the task, put
+      // the real screen in front of her, and hand the decision to the user.
+      if (consecutiveBlocks >= 3) {
+        Log.w(TAG, "escalating after $consecutiveBlocks ignored blocks — pausing task")
+        consecutiveBlocks = 0
+        taskActive = false
+        pendingLook = true
+        return JSONObject()
+          .put("ok", false)
+          .put("stop", true)
+          .put(
+            "error",
+            "STOP. You have now tried the same blocked action several times in a row. It cannot work. " +
+              "A screenshot of the real screen follows."
+          )
+          .put(
+            "do_instead",
+            "Look at that screenshot. Tell the user OUT LOUD, in plain words: where you actually are, what you were " +
+              "trying to do, and what is blocking you. Then ask them how they want to proceed. Do NOT take another " +
+              "action until they answer."
+          )
+      }
       return JSONObject()
         .put("ok", false)
         .put("looping", true)
@@ -1230,6 +1264,22 @@ class ChakaLive(
         )
       }
       "press_enter" -> withOutcome(dump, "enter", JSONObject().put("ok", service.pressEnter()))
+      "read_clipboard" -> {
+        val clip = service.readClipboard()
+        if (clip.isNullOrBlank()) {
+          JSONObject().put("ok", false).put("error", "The clipboard is empty — the copy did not work.")
+        } else {
+          JSONObject()
+            .put("ok", true)
+            .put("clipboard", clip.take(400))
+            .put("length", clip.length)
+            .put(
+              "check",
+              "Is this actually the value you meant to copy? A key or token is a long string of random characters — " +
+                "if this looks like a label or a name instead, the copy grabbed the wrong thing, so go back and copy properly."
+            )
+        }
+      }
       "swipe" -> {
         val w = dump.optInt("w"); val h = dump.optInt("h")
         val cx = w / 2; val cy = h / 2

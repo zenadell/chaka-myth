@@ -164,6 +164,12 @@ class ChakaAccessibilityService : AccessibilityService() {
     }.getOrDefault(false)
   }
 
+  /** Current clipboard text, so a copy can be verified before it's pasted. */
+  fun readClipboard(): String? = runCatching {
+    val clip = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+    clip.primaryClip?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.coerceToText(this)?.toString()
+  }.getOrNull()
+
   /** Depth-first search for the first visible editable node (used for WebView fields). */
   private fun findEditable(node: AccessibilityNodeInfo?): AccessibilityNodeInfo? {
     if (node == null) return null
