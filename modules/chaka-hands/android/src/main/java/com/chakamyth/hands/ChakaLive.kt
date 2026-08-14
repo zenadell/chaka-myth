@@ -113,6 +113,15 @@ class ChakaLive(
   // to look again, that is a self-sustaining loop that also drowns out the user.
   // Consecutive refused actions. A block she ignores is worse than no block -
   // she hammered the same blocked tap eleven times in a row.
+  // Half-duplex gate. Her own voice was leaking into the mic and the VAD kept
+  // scoring it as the user barging in - "interrupted by user" fired about once
+  // a second and EVERY turn ended with said="", so she never finished a
+  // sentence or a thought. Hardware AEC isn't reliable enough here, so the mic
+  // simply stops uploading while she is speaking.
+  @Volatile private var lastAudioOutAt = 0L
+  // A turn that was cut off isn't a turn she chose to end - pushing her to
+  // "continue" after one just makes her act without having finished thinking.
+  @Volatile private var interruptedThisTurn = false
   @Volatile private var consecutiveBlocks = 0
   @Volatile private var lastLookSig = ""
   @Volatile private var lastLookAt = 0L
@@ -563,6 +572,7 @@ class ChakaLive(
       // still queued and let them lead.
       if (content.optBoolean("interrupted", false)) {
         runCatching { player?.pause(); player?.flush(); player?.play() }
+        interruptedThisTurn = true
         Log.i(TAG, "interrupted by user")
         return@let
       }
@@ -627,14 +637,17 @@ class ChakaLive(
         Log.i(TAG, "turnComplete said=\"${said.take(90)}\" tool=$toolCalledThisTurn")
         if (said.isNotEmpty()) ChakaGuideOverlay.update(said.take(160))
         val actedThisTurn = toolCalledThisTurn
+        val wasInterrupted = interruptedThisTurn
+        interruptedThisTurn = false
         toolCalledThisTurn = false
+        if (wasInterrupted) Log.i(TAG, "turn was cut off — not pushing her to continue")
         lastActivityAt = System.currentTimeMillis()
         // She finished a turn without touching the phone. If she promised to do
         // something, push her to actually do it — otherwise the session just
         // stalls until the user shouts, which is the whole complaint.
         if (!actedThisTurn && taskActive && promisedAction(said)) {
           checkTurn(ws, said)
-        } else if (taskActive) {
+        } else if (taskActive && !interruptedThisTurn) {
           // The heart of it: she ends her turn after ONE action and yields, so
           // every step used to cost the user an 8s wait or a shout. A turn
           // ending with the task still open is the trigger to carry straight on.
@@ -843,6 +856,9 @@ class ChakaLive(
     if (AcousticEchoCanceler.isAvailable()) {
       aec = runCatching { AcousticEchoCanceler.create(rec.audioSessionId) }.getOrNull()
       aec?.enabled = true
+      Log.i(TAG, "AEC available, enabled=${aec?.enabled}")
+    } else {
+      Log.w(TAG, "no hardware AEC on this device — relying on the half-duplex gate")
     }
     rec.startRecording()
 
@@ -852,6 +868,9 @@ class ChakaLive(
       while (!cancelled && ready) {
         val n = try { rec.read(buf, 0, buf.size) } catch (e: Exception) { -1 }
         if (n <= 0) continue
+        // Keep draining the mic (so the buffer doesn't back up) but don't send
+        // while she's speaking, or she hears herself and cuts herself off.
+        if (System.currentTimeMillis() - lastAudioOutAt < 500) continue
         // Don't stream our own output back in — that's what kept "interrupting"
         // her mid-sentence and leaving turns empty.
         if (speaking) continue
