@@ -60,6 +60,38 @@ class ChakaOperator(private val service: ChakaAccessibilityService) {
       return APP_MAP[key] ?: if (name.contains(".")) name else null
     }
 
+    /**
+     * Resolves an app name against what is ACTUALLY installed, by launcher
+     * label. The hardcoded map maps "tiktok" to the full TikTok package, but
+     * this phone has TikTok Lite - so open_app failed as "not installed" while
+     * the icon sat on the home screen, and she resorted to hunting for it.
+     */
+    fun resolveInstalled(context: android.content.Context, name: String): String? {
+      val pm = context.packageManager
+      val want = name.lowercase().trim()
+      // A mapped package that's genuinely present wins.
+      appPackage(name)?.let { mapped ->
+        if (runCatching { pm.getLaunchIntentForPackage(mapped) }.getOrNull() != null) return mapped
+      }
+      val launchable = runCatching {
+        pm.queryIntentActivities(
+          android.content.Intent(android.content.Intent.ACTION_MAIN)
+            .addCategory(android.content.Intent.CATEGORY_LAUNCHER),
+          0
+        )
+      }.getOrNull() ?: return null
+
+      data class App(val pkg: String, val label: String)
+      val apps = launchable.mapNotNull { ri ->
+        val pkg = ri.activityInfo?.packageName ?: return@mapNotNull null
+        App(pkg, ri.loadLabel(pm).toString().lowercase())
+      }
+      // Exact label, then label starts-with, then either side containing the other.
+      return apps.firstOrNull { it.label == want }?.pkg
+        ?: apps.firstOrNull { it.label.startsWith(want) }?.pkg
+        ?: apps.firstOrNull { it.label.contains(want) || want.contains(it.label) }?.pkg
+    }
+
     private const val ACTION_MENU = """Action types (ONE per turn):
 - {"type":"tap_index","index":N}  tap element [N] from the list — PREFER THIS when the target is listed
 - {"type":"tap","x":0.5,"y":0.3}  tap a point as FRACTIONS 0..1 (for things NOT in the list)

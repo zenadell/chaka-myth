@@ -987,7 +987,7 @@ class ChakaLive(
         if (n <= 0) continue
         // Keep draining the mic (so the buffer doesn't back up) but don't send
         // while she's speaking, or she hears herself and cuts herself off.
-        if (System.currentTimeMillis() - lastAudioOutAt < 500) continue
+        if (System.currentTimeMillis() - lastAudioOutAt < 900) continue
         // Don't stream our own output back in — that's what kept "interrupting"
         // her mid-sentence and leaving turns empty.
         if (speaking) continue
@@ -1151,6 +1151,24 @@ class ChakaLive(
   }
 
   /** Label of element [i] on the current screen, if present. */
+  /**
+   * Turns whatever she sent into a real on-screen point, or null if it can't be
+   * one. Fractions (0..1) are the documented form; plain pixels are accepted
+   * because she reaches for them anyway; anything outside the screen is refused
+   * rather than dispatched into nowhere.
+   */
+  private fun normalizeCoords(rx: Double, ry: Double, w: Int, h: Int): Pair<Int, Int>? {
+    if (rx < 0 || ry < 0 || w <= 0 || h <= 0) return null
+    val x: Int; val y: Int
+    if (rx <= 1.0 && ry <= 1.0) {
+      x = (rx * w).toInt(); y = (ry * h).toInt()
+    } else {
+      x = rx.toInt(); y = ry.toInt()
+    }
+    if (x !in 0..w || y !in 0..h) return null
+    return x to y
+  }
+
   private fun elementLabel(dump: JSONObject, i: Int): String? {
     val els = dump.optJSONArray("els") ?: return null
     for (k in 0 until els.length()) {
@@ -1569,8 +1587,17 @@ class ChakaLive(
       // Fractional coordinates: the escape hatch for everything the tree can't
       // describe (web buttons, gallery photos, custom UI).
       "tap_at" -> {
-        val x = (args.optDouble("x", -1.0) * dump.optInt("w")).toInt()
-        val y = (args.optDouble("y", -1.0) * dump.optInt("h")).toInt()
+        val w = dump.optInt("w"); val h = dump.optInt("h")
+        val rx = args.optDouble("x", -1.0); val ry = args.optDouble("y", -1.0)
+        // She sometimes sends 150 instead of 0.15. Unvalidated, that was
+        // multiplied by the screen size and tapped at 108000,240000 - far off
+        // screen, silently. Accept fractions or real pixels, reject nonsense.
+        val (x, y) = normalizeCoords(rx, ry, w, h)
+          ?: return JSONObject().put("ok", false).put(
+            "error",
+            "x=$rx y=$ry are not valid coordinates. Use FRACTIONS between 0 and 1 " +
+              "(0.5, 0.5 is the centre of the screen), or exact pixels within ${w}x${h}."
+          )
         if (x < 0 || y < 0) JSONObject().put("ok", false).put("error", "x and y must be 0..1")
         else {
           // Round to a coarse grid: tapping 3px away is the same attempt.
@@ -1581,8 +1608,13 @@ class ChakaLive(
         }
       }
       "long_press_at" -> {
-        val x = (args.optDouble("x", -1.0) * dump.optInt("w")).toInt()
-        val y = (args.optDouble("y", -1.0) * dump.optInt("h")).toInt()
+        val w = dump.optInt("w"); val h = dump.optInt("h")
+        val rx = args.optDouble("x", -1.0); val ry = args.optDouble("y", -1.0)
+        val (x, y) = normalizeCoords(rx, ry, w, h)
+          ?: return JSONObject().put("ok", false).put(
+            "error",
+            "x=$rx y=$ry are not valid coordinates. Use fractions 0..1, or exact pixels within ${w}x${h}."
+          )
         if (x < 0 || y < 0) JSONObject().put("ok", false).put("error", "x and y must be 0..1")
         else { service.swipe(x, y, x, y, 650); JSONObject().put("ok", true) }
       }
@@ -1667,8 +1699,11 @@ class ChakaLive(
         withOutcome(dump, "press:$b", JSONObject().put("ok", service.globalAction(b)))
       }
       "open_app" -> {
-        val pkg = ChakaOperator.appPackage(args.optString("app"))
-        if (pkg == null) JSONObject().put("ok", false).put("error", "unknown app")
+        val wanted = args.optString("app")
+        val pkg = ChakaOperator.resolveInstalled(context, wanted)
+        if (pkg == null) JSONObject().put("ok", false)
+          .put("error", "No installed app matches \"$wanted\".")
+          .put("do_now", "Open the app drawer and look for it by name, or use its exact label as shown under the icon.")
         else {
           val intent = context.packageManager.getLaunchIntentForPackage(pkg)
           if (intent == null) JSONObject().put("ok", false).put("error", "not installed")
