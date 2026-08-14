@@ -312,6 +312,9 @@ class ChakaLive(
       "- If the connection drops (they may be on a call), pick straight back up when you return — say you're back and resume any unfinished task.\n" +
       "- OBSTACLES ARE YOURS TO CLEAR, not theirs. Permission dialogs (Allow / While using the app), cookie or consent banners, ads, 'Not now', update prompts, rating popups — deal with them yourself the instant they appear: accept what the task needs, dismiss or close anything it doesn't. Never stop and stare at a popup waiting for instructions.\n" +
       "- SWIPE MEANS CONTENT, NOT FINGER. 'down' reveals what is FURTHER DOWN the page; 'up' goes back toward the TOP. Never swipe to reach the app drawer or notifications — use open_app_drawer or press_button instead, so you can't land in the wrong place.\n" +
+      "- NEVER CLAIM AN ACTION WORKED WHEN screen_changed IS false. If you swipe and the screen did not move, the page did NOT turn — say so out loud and try a different way. Telling the user something happened when the result says it didn't is the worst thing you can do; they are relying on you to be accurate about their phone.\n" +
+      "- DO EXACTLY THE TASK ASKED, NOTHING ELSE. 'Second page of the app menu' means the app menu's second page — not the home screen, not the third page, not a different app. If you get stuck, stay on the goal and say what's blocking you. Opening something unrelated and calling it done is never acceptable.\n" +
+      "- KNOW WHERE YOU ARE before swiping between pages. The home screen and the app drawer look similar and both have pages. Check now_in_app and the screen contents first; if you're on the wrong one, fix that before paging.\n" +
       "- YOU CANNOT REPEAT YOURSELF. The system remembers every screen you've been on and every action you took from it. Try the same thing from the same screen twice and it will be refused, with a list of what you already tried there. If you see 'looping' or 'been_here_before', stop and take a genuinely different route immediately — that is a circle, and repeating it wastes the user's time.\n" +
       "- EVERY ACTION TELLS YOU WHAT IT DID. Each result includes now_in_app, screen_changed and screen_now. READ THEM. If screen_changed is false, that move failed — change approach, never repeat it. If now_in_app isn't where you meant to be, you went the wrong way: press back and correct it immediately.\n" +
       "- TYPING ACCURACY: type the EXACT words asked for. After typing, read the field back on screen and confirm it matches; if it's wrong, clear it and retype before searching. Searching for the wrong text wastes far more time than checking.\n" +
@@ -1031,7 +1034,11 @@ class ChakaLive(
     if (!changed) {
       result.put(
         "warning",
-        "That did NOT change the screen. Do something different — the same action again will fail the same way."
+        if (action.startsWith("swipe"))
+          "THE SCREEN DID NOT MOVE. The page did not change. You are still exactly where you were — " +
+            "do NOT tell the user it moved, and do not repeat the same swipe."
+        else
+          "That did NOT change the screen. Do something different — the same action again will fail the same way."
       )
     }
     if (sameActionRepeats >= 2) {
@@ -1075,9 +1082,9 @@ class ChakaLive(
         )
         .put(
           "do_instead",
-          "Do NOT repeat any of those. Call look_at_screen to actually see where you are, then pick a different " +
-            "route — a different element, a different app, or the search box. If nothing here can work, say so and " +
-            "tell the user what you need."
+          "Do NOT repeat any of those. Call look_at_screen to see where you actually are, then find a different route " +
+            "TO THE SAME GOAL. Never substitute an unrelated action and never claim the goal is met — if you genuinely " +
+            "cannot find a way from here, say plainly what you tried and what is blocking you, and ask the user."
         )
         .put("screen_now", screenBrief(dump))
     }
@@ -1167,14 +1174,18 @@ class ChakaLive(
         // notification shade — she kept "scrolling" straight into it.
         val top = (h * 0.22).toInt()
         val bottom = (h * 0.78).toInt()
-        val dy = (h * frac).toInt(); val dx = (w * frac).toInt()
+        val dy = (h * frac).toInt()
         val dir = args.optString("direction", "down")
         loopGuard(dump, "swipe:$dir")?.let { return it }
+        // Horizontal swipes have to be a proper FLING or the page springs back.
+        // The old 32%-of-width drag over 300ms was too short and too slow to
+        // commit a launcher page — it moved halfway and snapped home, which read
+        // as "the swipe does nothing".
         val res = when (dir) {
-          "up" -> service.swipe(cx, (cy - dy).coerceAtLeast(top), cx, (cy + dy).coerceAtMost(bottom), 300)
-          "left" -> service.swipe(cx + dx, cy, cx - dx, cy, 300)
-          "right" -> service.swipe(cx - dx, cy, cx + dx, cy, 300)
-          else -> service.swipe(cx, (cy + dy).coerceAtMost(bottom), cx, (cy - dy).coerceAtLeast(top), 300)
+          "up" -> service.swipe(cx, (cy - dy).coerceAtLeast(top), cx, (cy + dy).coerceAtMost(bottom), 280)
+          "left" -> service.swipe((w * 0.88).toInt(), cy, (w * 0.12).toInt(), cy, 170)
+          "right" -> service.swipe((w * 0.12).toInt(), cy, (w * 0.88).toInt(), cy, 170)
+          else -> service.swipe(cx, (cy + dy).coerceAtMost(bottom), cx, (cy - dy).coerceAtLeast(top), 280)
         }
         withOutcome(dump, "swipe:$dir", JSONObject().put("ok", res))
       }
