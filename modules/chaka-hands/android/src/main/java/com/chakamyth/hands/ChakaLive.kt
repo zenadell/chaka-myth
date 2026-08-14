@@ -118,6 +118,10 @@ class ChakaLive(
   // a second and EVERY turn ended with said="", so she never finished a
   // sentence or a thought. Hardware AEC isn't reliable enough here, so the mic
   // simply stops uploading while she is speaking.
+  // Hard stop. "Stop" must not depend on the model choosing to co-operate -
+  // it ignored spoken stops and carried on with things the user didn't want.
+  // This halts locally: every action is refused until they speak again.
+  @Volatile private var halted = false
   @Volatile private var lastAudioOutAt = 0L
   // A turn that was cut off isn't a turn she chose to end - pushing her to
   // "continue" after one just makes her act without having finished thinking.
@@ -128,6 +132,12 @@ class ChakaLive(
   // What the user has said recently. The destructive-action rail consults this
   // so it blocks a runaway agent without blocking the user's own instruction.
   private val recentSpeech = StringBuilder()
+  // The plan, held natively rather than in the model's head. It's replayed with
+  // every action result so a mis-tap or a surprise screen can't make her forget
+  // the objective and wander into some unrelated app.
+  private val plan = ArrayList<String>()
+  @Volatile private var planStep = 0
+  @Volatile private var planGoal = ""
   // Action memory. Consecutive-repeat detection can't see an A->B->A->B loop:
   // swipe opens the drawer, swipe returns home, repeat - the screen changes
   // every time, so a "did it change?" check never fires. What's needed is
@@ -159,6 +169,9 @@ class ChakaLive(
     // seconds and choked the session.
     private const val MIN_DRIVE_GAP_MS = 12000L
     private const val OUT_RATE = 24000   // model's audio output rate
+    private val STOP_WORDS = listOf(
+      "stop", "wait", "don't", "dont", "cancel", "abort", "hold on", "no no", "quit"
+    )
   }
 
   private val client = OkHttpClient.Builder()
@@ -333,6 +346,10 @@ class ChakaLive(
       "- If the connection drops (they may be on a call), pick straight back up when you return — say you're back and resume any unfinished task.\n" +
       "- OBSTACLES ARE YOURS TO CLEAR, not theirs. Permission dialogs (Allow / While using the app), cookie or consent banners, ads, 'Not now', update prompts, rating popups — deal with them yourself the instant they appear: accept what the task needs, dismiss or close anything it doesn't. Never stop and stare at a popup waiting for instructions.\n" +
       "- SWIPE MEANS CONTENT, NOT FINGER. 'down' reveals what is FURTHER DOWN the page; 'up' goes back toward the TOP. Never swipe to reach the app drawer or notifications — use open_app_drawer or press_button instead, so you can't land in the wrong place.\n" +
+      "- PLAN BEFORE YOU ACT. Anything with more than one step: call set_plan first with the goal and the ordered steps. The plan is saved and handed back to you after EVERY action, so check it each time — it is what keeps you on the objective when something unexpected happens.\n" +
+      "- WORK THE PLAN ONE STEP AT A TIME: look if you need to, act, then CHECK the result (screen_changed / screen_now / your own eyes) before calling step_done. If a step went wrong, fix that step — do not skip ahead and do not abandon the plan to go do something else.\n" +
+      "- A MISTAKE IS NOT A REASON TO CHANGE THE GOAL. If you tap the wrong thing, go back and get that step right. Never quietly switch to a different app or a different objective; the user asked for one thing.\n" +
+      "- WHEN THE USER SAYS STOP, YOU STOP. Stop, wait, don't, cancel — the tools will refuse to act. Acknowledge it, say briefly what you had done, and wait. Never argue or finish the action first.\n" +
       "- COPYING IS NOT VERIFIED UNTIL YOU READ IT BACK. After tapping any Copy button, call read_clipboard before you paste. Copy buttons very often grab the label next to a value rather than the value itself, and pasting a name where a key should be is silent and useless.\n" +
       "- USE YOUR EYES BEFORE SAYING ANYTHING IS DONE. You can SEE — call look_at_screen and actually check. Never say an account is created, a page is open, a message is sent or a task is finished unless you have just looked and can see it. Saying it does not make it so.\n" +
       "- WEB PAGES NEED YOUR EYES. Inside Chrome or any browser the element list is often nearly empty even though the page is full of buttons. If read_screen comes back thin or blank and you're in a browser, call look_at_screen and work from the picture with tap_at.\n" +
@@ -579,21 +596,42 @@ class ChakaLive(
 
       // The user said something → there's a live instruction to execute.
       content.optJSONObject("inputTranscription")?.optString("text")
-        ?.takeIf { it.isNotBlank() }?.let {
-          taskActive = true
-          nudges = 0
-          drives = 0
-          idleTurns = 0
-          autoContinues = 0
-          awaitingDoneProof = false
+        ?.takeIf { it.isNotBlank() }?.let { heard ->
           // Critical: give her room to answer. Without this the drive loop fired
           // a [SYSTEM] turn on top of the user's turn and the session wedged.
           lastActivityAt = System.currentTimeMillis()
+          val said = heard.lowercase().trim()
+          val words = said.split(Regex("\\s+")).size
+
+          if (STOP_WORDS.any { w -> said.contains(w) }) {
+            // Stop is enforced here, not left to the model — it ignored spoken
+            // stops and kept going with things the user didn't want.
+            halted = true
+            taskActive = false
+            autoContinues = 0
+            drives = 0
+            pendingLook = false
+            plan.clear(); planStep = 0; planGoal = ""
+            runCatching { player?.pause(); player?.flush(); player?.play() }  // cut her off mid-sentence
+            Log.w(TAG, "HARD STOP heard: \"$heard\"")
+            ChakaGuideOverlay.update("⏸ Stopped")
+          } else if (words >= 3) {
+            // Only a real sentence starts work. Stray words the mic caught from
+            // the room were kicking off tasks nobody asked for.
+            halted = false
+            taskActive = true
+            nudges = 0
+            drives = 0
+            idleTurns = 0
+            autoContinues = 0
+            awaitingDoneProof = false
+          }
+
           synchronized(recentSpeech) {
-            recentSpeech.append(' ').append(it.lowercase())
+            recentSpeech.append(' ').append(said)
             if (recentSpeech.length > 600) recentSpeech.delete(0, recentSpeech.length - 600)
           }
-          Log.i(TAG, "user: $it")
+          Log.i(TAG, "user: $heard")
         }
 
       // Accumulate what SHE said this turn, so we can tell talk from action.
@@ -1105,6 +1143,14 @@ class ChakaLive(
    * carries the app she landed in, whether the screen moved, and a repeat
    * warning, so a wrong move is self-evident on the very next step.
    */
+  private fun planText(): String {
+    if (plan.isEmpty()) return "(no plan set — call set_plan if this needs more than one step)"
+    return "GOAL: $planGoal\n" + plan.mapIndexed { i, st ->
+      val mark = when { i < planStep -> "[x]"; i == planStep -> "[NOW]"; else -> "[ ]" }
+      "$mark ${i + 1}. $st"
+    }.joinToString("\n")
+  }
+
   private fun withOutcome(before: JSONObject, action: String, result: JSONObject): JSONObject {
     Thread.sleep(550)  // let the UI settle
     val after = runCatching { JSONObject(service.dumpScreen()) }.getOrNull() ?: return result
@@ -1112,6 +1158,7 @@ class ChakaLive(
     val app = after.optString("pkg")
 
     consecutiveBlocks = 0
+    if (plan.isNotEmpty()) result.put("your_plan", planText())
     if (action == lastActionSig && !changed) sameActionRepeats++ else sameActionRepeats = 0
     lastActionSig = action
     recordAction(sig(before), action, sig(after))
@@ -1221,6 +1268,19 @@ class ChakaLive(
   }
 
   private fun executeTool(name: String, args: JSONObject): JSONObject {
+    // Nothing touches the phone while halted, whatever the model decides.
+    if (halted && name !in setOf("read_screen", "look_at_screen", "read_clipboard", "task_done")) {
+      Log.w(TAG, "refused '$name' — halted by the user")
+      return JSONObject()
+        .put("ok", false)
+        .put("halted", true)
+        .put(
+          "error",
+          "The user told you to STOP. You are not permitted to act. Do not continue the previous task, " +
+            "do not try another route. Acknowledge that you stopped, briefly say what you had done so far, " +
+            "and wait for their next instruction."
+        )
+    }
     val dump = runCatching { JSONObject(service.dumpScreen()) }.getOrNull()
       ?: return JSONObject().put("error", "couldn't read the screen")
 
@@ -1283,6 +1343,27 @@ class ChakaLive(
         )
       }
       "press_enter" -> withOutcome(dump, "enter", JSONObject().put("ok", service.pressEnter()))
+      "set_plan" -> {
+        plan.clear()
+        planGoal = args.optString("goal")
+        val arr = args.optJSONArray("steps")
+        if (arr != null) for (i in 0 until arr.length()) plan.add(arr.optString(i))
+        planStep = 0
+        Log.i(TAG, "PLAN set: \"$planGoal\" (${plan.size} steps)")
+        ChakaGuideOverlay.update("Plan: $planGoal")
+        JSONObject().put("ok", true).put("plan", planText())
+          .put("next", "Now do step 1. Look first if you need to, act, then check it worked before calling step_done.")
+      }
+      "step_done" -> {
+        if (planStep < plan.size) planStep++
+        Log.i(TAG, "step_done -> now on step ${planStep + 1}/${plan.size}")
+        JSONObject().put("ok", true).put("plan", planText())
+          .put(
+            "next",
+            if (planStep >= plan.size) "All steps are done. Verify the goal is truly met, then call task_done."
+            else "Now do step ${planStep + 1}: ${plan.getOrNull(planStep)}"
+          )
+      }
       "read_clipboard" -> {
         val clip = service.readClipboard()
         if (clip.isNullOrBlank()) {
@@ -1371,6 +1452,7 @@ class ChakaLive(
         taskActive = false
         drives = 0
         autoContinues = 0
+        plan.clear(); planStep = 0; planGoal = ""
         Log.i(TAG, "task_done: ${args.optString("summary")}")
         ChakaGuideOverlay.update("✓ ${args.optString("summary").take(140)}")
         // She used to fall silent here and the user had to ask "are you done?".
