@@ -107,6 +107,13 @@ class ChakaLive(
   // What the user has said recently. The destructive-action rail consults this
   // so it blocks a runaway agent without blocking the user's own instruction.
   private val recentSpeech = StringBuilder()
+  // Action memory. Consecutive-repeat detection can't see an A->B->A->B loop:
+  // swipe opens the drawer, swipe returns home, repeat - the screen changes
+  // every time, so a "did it change?" check never fires. What's needed is
+  // memory of WHERE she has been and WHAT she already tried from there.
+  private val stateActionCount = HashMap<String, Int>()   // screen+action -> times
+  private val stateVisits = HashMap<String, Int>()        // screen -> times seen
+  private val triedFromState = HashMap<String, LinkedHashSet<String>>()
   private var supervisorThread: Thread? = null
   private var lastGoal = ""
   private var lastKey = ""
@@ -305,6 +312,7 @@ class ChakaLive(
       "- If the connection drops (they may be on a call), pick straight back up when you return — say you're back and resume any unfinished task.\n" +
       "- OBSTACLES ARE YOURS TO CLEAR, not theirs. Permission dialogs (Allow / While using the app), cookie or consent banners, ads, 'Not now', update prompts, rating popups — deal with them yourself the instant they appear: accept what the task needs, dismiss or close anything it doesn't. Never stop and stare at a popup waiting for instructions.\n" +
       "- SWIPE MEANS CONTENT, NOT FINGER. 'down' reveals what is FURTHER DOWN the page; 'up' goes back toward the TOP. Never swipe to reach the app drawer or notifications — use open_app_drawer or press_button instead, so you can't land in the wrong place.\n" +
+      "- YOU CANNOT REPEAT YOURSELF. The system remembers every screen you've been on and every action you took from it. Try the same thing from the same screen twice and it will be refused, with a list of what you already tried there. If you see 'looping' or 'been_here_before', stop and take a genuinely different route immediately — that is a circle, and repeating it wastes the user's time.\n" +
       "- EVERY ACTION TELLS YOU WHAT IT DID. Each result includes now_in_app, screen_changed and screen_now. READ THEM. If screen_changed is false, that move failed — change approach, never repeat it. If now_in_app isn't where you meant to be, you went the wrong way: press back and correct it immediately.\n" +
       "- TYPING ACCURACY: type the EXACT words asked for. After typing, read the field back on screen and confirm it matches; if it's wrong, clear it and retype before searching. Searching for the wrong text wastes far more time than checking.\n" +
       "- Finish the whole intent, not the setup for it. 'Play X' means the song is PLAYING, not that you searched for it. 'Message X' means sent. Keep going until the real outcome is on screen.\n" +
@@ -1007,6 +1015,17 @@ class ChakaLive(
 
     if (action == lastActionSig && !changed) sameActionRepeats++ else sameActionRepeats = 0
     lastActionSig = action
+    recordAction(sig(before), action, sig(after))
+
+    val visits = stateVisits[sig(after)] ?: 0
+    if (visits >= 3) {
+      result.put(
+        "been_here_before",
+        "You have landed on this screen $visits times now. Whatever you keep doing brings you back here — " +
+          "stop and choose a genuinely different route. Already tried from here: " +
+          (triedFromState[sig(after)]?.joinToString(", ") ?: "(none)")
+      )
+    }
 
     result.put("screen_changed", changed).put("now_in_app", app).put("screen_now", screenBrief(after))
     if (!changed) {
@@ -1030,6 +1049,48 @@ class ChakaLive(
       )
     }
     return result
+  }
+
+  /**
+   * Refuses an action she has already tried from this exact screen. This is what
+   * breaks oscillation: the pair (screen, action) is the thing that repeats, not
+   * the action alone. The refusal also hands back everything already attempted
+   * from here, so the next choice is an informed one rather than another guess.
+   */
+  private fun loopGuard(dump: JSONObject, action: String): JSONObject? {
+    val state = sig(dump)
+    val key = "$state|$action"
+    val times = (stateActionCount[key] ?: 0)
+    if (times >= 2) {
+      val tried = triedFromState[state]?.joinToString(", ") ?: "(none recorded)"
+      val visits = stateVisits[state] ?: 0
+      Log.w(TAG, "LOOP BLOCKED: '$action' already tried $times times from this screen (seen ${visits}x)")
+      return JSONObject()
+        .put("ok", false)
+        .put("looping", true)
+        .put(
+          "error",
+          "You have already done '$action' $times times from THIS EXACT SCREEN and it brought you back here. " +
+            "You are going in a circle. Already tried from this screen: $tried."
+        )
+        .put(
+          "do_instead",
+          "Do NOT repeat any of those. Call look_at_screen to actually see where you are, then pick a different " +
+            "route — a different element, a different app, or the search box. If nothing here can work, say so and " +
+            "tell the user what you need."
+        )
+        .put("screen_now", screenBrief(dump))
+    }
+    return null
+  }
+
+  private fun recordAction(beforeSig: String, action: String, afterSig: String) {
+    val key = "$beforeSig|$action"
+    stateActionCount[key] = (stateActionCount[key] ?: 0) + 1
+    triedFromState.getOrPut(beforeSig) { LinkedHashSet() }.add(action)
+    stateVisits[afterSig] = (stateVisits[afterSig] ?: 0) + 1
+    // Keep the memory bounded over a long session.
+    if (stateActionCount.size > 400) { stateActionCount.clear(); triedFromState.clear(); stateVisits.clear() }
   }
 
   private fun executeTool(name: String, args: JSONObject): JSONObject {
@@ -1078,8 +1139,9 @@ class ChakaLive(
         }
         if (hit == null) JSONObject().put("ok", false).put("error", "no element [$idx] — call read_screen again")
         else {
-          service.tap(hit.optInt("cx"), hit.optInt("cy"))
           val label = hit.optString("text", hit.optString("desc", ""))
+          loopGuard(dump, "tap:$label")?.let { return it }
+          service.tap(hit.optInt("cx"), hit.optInt("cy"))
           withOutcome(dump, "tap:$label", JSONObject().put("ok", true).put("tapped", label))
         }
       }
@@ -1107,6 +1169,7 @@ class ChakaLive(
         val bottom = (h * 0.78).toInt()
         val dy = (h * frac).toInt(); val dx = (w * frac).toInt()
         val dir = args.optString("direction", "down")
+        loopGuard(dump, "swipe:$dir")?.let { return it }
         val res = when (dir) {
           "up" -> service.swipe(cx, (cy - dy).coerceAtLeast(top), cx, (cy + dy).coerceAtMost(bottom), 300)
           "left" -> service.swipe(cx + dx, cy, cx - dx, cy, 300)
@@ -1122,8 +1185,11 @@ class ChakaLive(
         val y = (args.optDouble("y", -1.0) * dump.optInt("h")).toInt()
         if (x < 0 || y < 0) JSONObject().put("ok", false).put("error", "x and y must be 0..1")
         else {
+          // Round to a coarse grid: tapping 3px away is the same attempt.
+          val gx = (args.optDouble("x") * 10).toInt(); val gy = (args.optDouble("y") * 10).toInt()
+          loopGuard(dump, "tap_at:$gx,$gy")?.let { return it }
           service.tap(x, y)
-          withOutcome(dump, "tap_at:$x,$y", JSONObject().put("ok", true).put("tapped_at", "$x,$y"))
+          withOutcome(dump, "tap_at:$gx,$gy", JSONObject().put("ok", true).put("tapped_at", "$x,$y"))
         }
       }
       "long_press_at" -> {
@@ -1155,6 +1221,7 @@ class ChakaLive(
           .put("note", "Screenshot is being sent now and arrives in the NEXT message. Look at it, then continue the task.")
       }
       "open_app_drawer" -> {
+        loopGuard(dump, "open_app_drawer")?.let { return it }
         // Doing this by hand kept going wrong: a plain "swipe up" from the
         // middle scrolls the page, and a long one starts in the notification
         // shade's gesture zone. Home first, then one deliberate bottom-to-top
@@ -1169,6 +1236,7 @@ class ChakaLive(
       "end_call" -> JSONObject().put("ok", service.endCall())
       "press_button" -> {
         val b = args.optString("button", "back")
+        loopGuard(dump, "press:$b")?.let { return it }
         withOutcome(dump, "press:$b", JSONObject().put("ok", service.globalAction(b)))
       }
       "open_app" -> {
