@@ -1631,6 +1631,28 @@ class ChakaLive(
         if (x < 0 || y < 0) JSONObject().put("ok", false).put("error", "x and y must be 0..1")
         else { service.swipe(x, y, x, y, 650); JSONObject().put("ok", true) }
       }
+      // Arbitrary two-point gesture — the only thing that can turn a picker
+      // wheel, move a slider or drag a carousel. A whole-screen swipe scrolls
+      // the page and leaves controls like these untouched.
+      "drag" -> {
+        val w = dump.optInt("w"); val h = dump.optInt("h")
+        val a = normalizeCoords(args.optDouble("from_x", -1.0), args.optDouble("from_y", -1.0), w, h)
+        val b = normalizeCoords(args.optDouble("to_x", -1.0), args.optDouble("to_y", -1.0), w, h)
+        if (a == null || b == null) {
+          JSONObject().put("ok", false)
+            .put("error", "drag needs from_x/from_y/to_x/to_y as fractions 0..1 (or pixels within ${w}x${h}).")
+        } else {
+          // Pickers need a deliberate drag; a fast flick overshoots or gets
+          // treated as a page fling instead of moving the control.
+          val dur = if (args.optBoolean("slow", true)) 600L else 220L
+          val ok = service.swipe(a.first, a.second, b.first, b.second, dur)
+          withOutcome(
+            dump,
+            "drag:${a.first / 50},${a.second / 50}->${b.first / 50},${b.second / 50}",
+            JSONObject().put("ok", ok).put("from", "${a.first},${a.second}").put("to", "${b.first},${b.second}")
+          )
+        }
+      }
       "task_done" -> {
         if (!awaitingDoneProof) {
           // Don't take her word for it. Send the actual screen and make her
