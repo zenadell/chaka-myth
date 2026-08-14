@@ -101,6 +101,9 @@ class ChakaLive(
   // Set when she calls look_at_screen; the image is injected right after that
   // tool's response rather than streamed continuously.
   @Volatile private var pendingLook = false
+  // Repeat detection for actions, so a wrong move can't be repeated blindly.
+  @Volatile private var lastActionSig = ""
+  @Volatile private var sameActionRepeats = 0
   private var supervisorThread: Thread? = null
   private var lastGoal = ""
   private var lastKey = ""
@@ -298,6 +301,8 @@ class ChakaLive(
       "- When you call task_done, SAY what you did and anything the user needs to know. Never finish in silence and make them ask 'are you done?'.\n" +
       "- If the connection drops (they may be on a call), pick straight back up when you return — say you're back and resume any unfinished task.\n" +
       "- OBSTACLES ARE YOURS TO CLEAR, not theirs. Permission dialogs (Allow / While using the app), cookie or consent banners, ads, 'Not now', update prompts, rating popups — deal with them yourself the instant they appear: accept what the task needs, dismiss or close anything it doesn't. Never stop and stare at a popup waiting for instructions.\n" +
+      "- SWIPE MEANS CONTENT, NOT FINGER. 'down' reveals what is FURTHER DOWN the page; 'up' goes back toward the TOP. Never swipe to reach the app drawer or notifications — use open_app_drawer or press_button instead, so you can't land in the wrong place.\n" +
+      "- EVERY ACTION TELLS YOU WHAT IT DID. Each result includes now_in_app, screen_changed and screen_now. READ THEM. If screen_changed is false, that move failed — change approach, never repeat it. If now_in_app isn't where you meant to be, you went the wrong way: press back and correct it immediately.\n" +
       "- TYPING ACCURACY: type the EXACT words asked for. After typing, read the field back on screen and confirm it matches; if it's wrong, clear it and retype before searching. Searching for the wrong text wastes far more time than checking.\n" +
       "- Finish the whole intent, not the setup for it. 'Play X' means the song is PLAYING, not that you searched for it. 'Message X' means sent. Keep going until the real outcome is on screen.\n" +
       "- STAY ON THE TASK. Only touch what the task needs. If you don't know what to do next, say so and ask — never wander through Settings, App info, recent apps or unrelated apps hoping to find something. Never force stop, uninstall, clear data, reset, delete or sign out of anything unless the user asked for that exact thing.\n" +
@@ -349,6 +354,11 @@ class ChakaLive(
       .put(fn(
         "look_at_screen",
         "Take a picture of the screen and look at it with your own eyes. Use this when read_screen isn't enough — web pages, photos, galleries, games, custom or image-based UI, or when you need to judge how something LOOKS. The image arrives in the next message.",
+        JSONObject()
+      ))
+      .put(fn(
+        "open_app_drawer",
+        "Open the app drawer (the full list of installed apps). Use this instead of swiping when you need to find, launch, uninstall or inspect an app. Goes to the home screen first, so it works from anywhere.",
         JSONObject()
       ))
       .put(fn("answer_call", "Answer the incoming phone call.", JSONObject()))
@@ -935,6 +945,68 @@ class ChakaLive(
     ).any { l.contains(it) }
   }
 
+  /** Compact description of the screen, for action feedback. */
+  private fun screenBrief(dump: JSONObject): String {
+    val els = dump.optJSONArray("els") ?: return "(nothing readable)"
+    val sb = StringBuilder()
+    var n = 0
+    for (k in 0 until els.length()) {
+      if (n >= 22) break
+      val e = els.optJSONObject(k) ?: continue
+      val label = e.optString("text", e.optString("desc", ""))
+      if (label.isBlank()) continue
+      sb.append("[").append(e.optInt("i")).append("] ").append(label.take(34))
+      if (e.optBoolean("toggle")) sb.append(if (e.optBoolean("on")) "(ON)" else "(OFF)")
+      sb.append("  ")
+      n++
+    }
+    return sb.toString().trim().ifEmpty { "(nothing readable)" }
+  }
+
+  private fun sig(dump: JSONObject): String =
+    dump.optJSONArray("els")?.toString()?.hashCode()?.toString() ?: ""
+
+  /**
+   * Runs an action and reports WHAT IT ACTUALLY DID. Previously every action
+   * returned a bare {"ok":true}, so she was acting blind: swipe, "ok", swipe
+   * again — which is how she ended up opening the notification shade over and
+   * over while believing she was heading for the app drawer. Now each result
+   * carries the app she landed in, whether the screen moved, and a repeat
+   * warning, so a wrong move is self-evident on the very next step.
+   */
+  private fun withOutcome(before: JSONObject, action: String, result: JSONObject): JSONObject {
+    Thread.sleep(550)  // let the UI settle
+    val after = runCatching { JSONObject(service.dumpScreen()) }.getOrNull() ?: return result
+    val changed = sig(after) != sig(before)
+    val app = after.optString("pkg")
+
+    if (action == lastActionSig && !changed) sameActionRepeats++ else sameActionRepeats = 0
+    lastActionSig = action
+
+    result.put("screen_changed", changed).put("now_in_app", app).put("screen_now", screenBrief(after))
+    if (!changed) {
+      result.put(
+        "warning",
+        "That did NOT change the screen. Do something different — the same action again will fail the same way."
+      )
+    }
+    if (sameActionRepeats >= 2) {
+      result.put(
+        "stop_repeating",
+        "You have now done '$action' $sameActionRepeats times with no progress. It is the wrong move. " +
+          "Look at screen_now, pick a DIFFERENT approach, or say what's blocking you."
+      )
+    }
+    // Landing somewhere the user didn't ask for is worth flagging loudly.
+    if (app == "com.android.systemui") {
+      result.put(
+        "note",
+        "You are in the system UI (notification shade / quick settings), not an app. Press back to leave it."
+      )
+    }
+    return result
+  }
+
   private fun executeTool(name: String, args: JSONObject): JSONObject {
     val dump = runCatching { JSONObject(service.dumpScreen()) }.getOrNull()
       ?: return JSONObject().put("error", "couldn't read the screen")
@@ -982,29 +1054,41 @@ class ChakaLive(
         if (hit == null) JSONObject().put("ok", false).put("error", "no element [$idx] — call read_screen again")
         else {
           service.tap(hit.optInt("cx"), hit.optInt("cy"))
-          JSONObject().put("ok", true).put("tapped", hit.optString("text", hit.optString("desc", "")))
+          val label = hit.optString("text", hit.optString("desc", ""))
+          withOutcome(dump, "tap:$label", JSONObject().put("ok", true).put("tapped", label))
         }
       }
       "type_text" -> {
-        val ok = service.typeText(args.optString("text"))
-        if (ok) JSONObject().put("ok", true)
-        else JSONObject().put("ok", false).put("error", "no field focused — tap the input first")
+        val wanted = args.optString("text")
+        val ok = service.typeText(wanted)
+        if (!ok) JSONObject().put("ok", false).put("error", "no field focused — tap the input first")
+        else withOutcome(
+          dump, "type:$wanted",
+          JSONObject().put("ok", true)
+            .put("verify", "Check screen_now shows exactly \"$wanted\". If it doesn't, clear the field and retype before continuing.")
+        )
       }
-      "press_enter" -> JSONObject().put("ok", service.pressEnter())
+      "press_enter" -> withOutcome(dump, "enter", JSONObject().put("ok", service.pressEnter()))
       "swipe" -> {
         val w = dump.optInt("w"); val h = dump.optInt("h")
         val cx = w / 2; val cy = h / 2
         val frac = when (args.optString("amount", "normal")) {
-          "tiny" -> 0.09; "long" -> 0.38; else -> 0.16
+          "tiny" -> 0.09; "long" -> 0.30; else -> 0.16
         }
+        // Stay inside the middle of the screen. A long swipe used to start at
+        // ~12% from the top, which Android reads as pulling down the
+        // notification shade — she kept "scrolling" straight into it.
+        val top = (h * 0.22).toInt()
+        val bottom = (h * 0.78).toInt()
         val dy = (h * frac).toInt(); val dx = (w * frac).toInt()
-        when (args.optString("direction", "down")) {
-          "up" -> service.swipe(cx, cy - dy, cx, cy + dy, 300)
+        val dir = args.optString("direction", "down")
+        val res = when (dir) {
+          "up" -> service.swipe(cx, (cy - dy).coerceAtLeast(top), cx, (cy + dy).coerceAtMost(bottom), 300)
           "left" -> service.swipe(cx + dx, cy, cx - dx, cy, 300)
           "right" -> service.swipe(cx - dx, cy, cx + dx, cy, 300)
-          else -> service.swipe(cx, cy + dy, cx, cy - dy, 300)
+          else -> service.swipe(cx, (cy + dy).coerceAtMost(bottom), cx, (cy - dy).coerceAtLeast(top), 300)
         }
-        JSONObject().put("ok", true)
+        withOutcome(dump, "swipe:$dir", JSONObject().put("ok", res))
       }
       // Fractional coordinates: the escape hatch for everything the tree can't
       // describe (web buttons, gallery photos, custom UI).
@@ -1012,7 +1096,10 @@ class ChakaLive(
         val x = (args.optDouble("x", -1.0) * dump.optInt("w")).toInt()
         val y = (args.optDouble("y", -1.0) * dump.optInt("h")).toInt()
         if (x < 0 || y < 0) JSONObject().put("ok", false).put("error", "x and y must be 0..1")
-        else { service.tap(x, y); JSONObject().put("ok", true).put("tapped_at", "$x,$y") }
+        else {
+          service.tap(x, y)
+          withOutcome(dump, "tap_at:$x,$y", JSONObject().put("ok", true).put("tapped_at", "$x,$y"))
+        }
       }
       "long_press_at" -> {
         val x = (args.optDouble("x", -1.0) * dump.optInt("w")).toInt()
@@ -1042,9 +1129,23 @@ class ChakaLive(
           .put("ok", true)
           .put("note", "Screenshot is being sent now and arrives in the NEXT message. Look at it, then continue the task.")
       }
+      "open_app_drawer" -> {
+        // Doing this by hand kept going wrong: a plain "swipe up" from the
+        // middle scrolls the page, and a long one starts in the notification
+        // shade's gesture zone. Home first, then one deliberate bottom-to-top
+        // swipe well inside the safe area.
+        service.globalAction("home")
+        Thread.sleep(700)
+        val w = dump.optInt("w"); val h = dump.optInt("h")
+        service.swipe(w / 2, (h * 0.80).toInt(), w / 2, (h * 0.28).toInt(), 260)
+        withOutcome(dump, "open_app_drawer", JSONObject().put("ok", true))
+      }
       "answer_call" -> JSONObject().put("ok", service.answerCall())
       "end_call" -> JSONObject().put("ok", service.endCall())
-      "press_button" -> JSONObject().put("ok", service.globalAction(args.optString("button", "back")))
+      "press_button" -> {
+        val b = args.optString("button", "back")
+        withOutcome(dump, "press:$b", JSONObject().put("ok", service.globalAction(b)))
+      }
       "open_app" -> {
         val pkg = ChakaOperator.appPackage(args.optString("app"))
         if (pkg == null) JSONObject().put("ok", false).put("error", "unknown app")
