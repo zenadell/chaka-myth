@@ -108,6 +108,7 @@ class ChakaLive(
   // only a second call - made after seeing it - is accepted. She had been
   // declaring victory with no evidence at all.
   @Volatile private var awaitingDoneProof = false
+  @Volatile private var doneProofAt = 0L
   // Guards against looking at the same screen over and over. Each injected
   // image ends a turn, which makes her respond - and if she responds by asking
   // to look again, that is a self-sustaining loop that also drowns out the user.
@@ -1659,6 +1660,13 @@ class ChakaLive(
         )
     }
 
+    // Verification is only good for the screen she just looked at. If she does
+    // anything else, the proof is stale and she has to look again - otherwise
+    // one early hold buys her an unchecked task_done later in the session.
+    if (awaitingDoneProof && name !in setOf("look_at_screen", "read_screen", "task_done")) {
+      awaitingDoneProof = false
+    }
+
     // Whatever she predicted this action would do, held for the check afterwards.
     args.optString("expect").takeIf { it.isNotBlank() }?.let { pendingExpect = it }
 
@@ -2062,10 +2070,15 @@ class ChakaLive(
           }
         }
 
+        if (awaitingDoneProof && System.currentTimeMillis() - doneProofAt > 25000) {
+          Log.i(TAG, "done-proof expired — re-verifying")
+          awaitingDoneProof = false
+        }
         if (!awaitingDoneProof) {
           // Don't take her word for it. Send the actual screen and make her
           // check every part of the request against it first.
           awaitingDoneProof = true
+          doneProofAt = System.currentTimeMillis()
           pendingLook = true
           val asked = synchronized(recentSpeech) { recentSpeech.toString().takeLast(280).trim() }
           return JSONObject()
