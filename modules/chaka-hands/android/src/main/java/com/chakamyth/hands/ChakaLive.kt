@@ -190,6 +190,31 @@ class ChakaLive(
     )
   }
 
+  /**
+   * Persistent memory for the live session, shared with the chat side of the
+   * app. Without it she had nowhere to put things: asked to save an email and
+   * password she stored the address correctly and then invented a password,
+   * because "remembering" meant holding it in a conversation that had already
+   * moved on. Values are written and read back verbatim.
+   */
+  private fun memStore() = context.getSharedPreferences("chaka.memory.v1", Context.MODE_PRIVATE)
+
+  private fun memRemember(label: String, value: String) {
+    memStore().edit().putString(label.lowercase().trim(), value).apply()
+  }
+
+  private fun memRecall(label: String): String? {
+    val all = memStore().all
+    val want = label.lowercase().trim()
+    (all[want] as? String)?.let { return it }
+    // Fall back to a loose match so "gmail password" finds "gmail" etc.
+    return all.entries.firstOrNull { (k, _) ->
+      k.contains(want) || want.contains(k)
+    }?.value as? String
+  }
+
+  private fun memLabels(): List<String> = memStore().all.keys.sorted()
+
   private val client = OkHttpClient.Builder()
     .readTimeout(0, TimeUnit.MILLISECONDS)  // keep the stream open indefinitely
     // Ping generously: a burst of upstream data shouldn't be mistaken for a
@@ -348,6 +373,10 @@ class ChakaLive(
       "You are Chaka, watching your owner's Android screen live and helping in real time. " +
       "You can SEE the screen (frames stream to you) and you can ACT on it with the provided tools.\n" +
       "GOAL / CONTEXT: ${goal.ifBlank { "Assist with whatever is on screen. Ask what they need." }}\n" +
+      (memLabels().takeIf { it.isNotEmpty() }?.let {
+        "ALREADY IN YOUR MEMORY (use recall to read any of these exactly): ${it.joinToString(", ")}\n"
+      } ?: "") +
+      "\nNEVER INVENT A VALUE. Passwords, codes, emails, account names: if the user gave it to you, remember() it the moment you hear it, and recall() it before typing. If it is not in memory, say you do not have it and ask - typing a made-up password is worse than useless, because it looks like it worked and silently isn't the real one.\n" +
       "\nACT — DO NOT TALK ABOUT ACTING. THIS OVERRIDES EVERYTHING ELSE:\n" +
       "- Saying something is NOT doing it. Words change nothing on the phone; only tool calls do.\n" +
       "- NEVER announce an action before performing it. These phrases are FORBIDDEN: 'I'm opening…', 'I'll tap…', 'I will now…', 'let me…', 'give me a second…', 'I'm going to…'. If you are about to say one, CALL THE TOOL INSTEAD.\n" +
@@ -1749,6 +1778,31 @@ class ChakaLive(
             }
           )
       }
+      "remember" -> {
+        val label = args.optString("label"); val value = args.optString("value")
+        if (label.isBlank() || value.isBlank()) {
+          JSONObject().put("ok", false).put("error", "remember needs both a label and a value")
+        } else {
+          memRemember(label, value)
+          Log.i(TAG, "remembered \"$label\" (${value.length} chars)")
+          JSONObject().put("ok", true).put("label", label).put("stored_length", value.length)
+            .put("note", "Saved exactly. Use recall(\"$label\") to get it back - do not retype it from memory.")
+        }
+      }
+      "recall" -> {
+        val label = args.optString("label")
+        val hit = memRecall(label)
+        if (hit == null) {
+          JSONObject().put("ok", false)
+            .put("error", "Nothing saved under \"$label\".")
+            .put("known_labels", JSONArray(memLabels()))
+            .put("do_now", "You do NOT know this value. Do not guess or invent one - ask the user for it, then remember() it.")
+        } else {
+          JSONObject().put("ok", true).put("label", label).put("value", hit)
+            .put("note", "This is the exact stored value. Type it character for character.")
+        }
+      }
+      "list_memory" -> JSONObject().put("ok", true).put("labels", JSONArray(memLabels()))
       "read_clipboard" -> {
         val clip = service.readClipboard()
         if (clip.isNullOrBlank()) {

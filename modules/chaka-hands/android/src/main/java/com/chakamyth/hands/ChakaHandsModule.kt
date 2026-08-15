@@ -244,6 +244,23 @@ class ChakaHandsModule : Module() {
       }
     }
 
+    // Same store the live session writes to, so what she saves by voice is
+    // visible in chat and vice versa.
+    Function("memoryAll") {
+      val prefs = context.getSharedPreferences("chaka.memory.v1", Context.MODE_PRIVATE)
+      JSONObject(prefs.all.mapValues { it.value?.toString() ?: "" }).toString()
+    }
+
+    Function("memorySet") { label: String, value: String ->
+      context.getSharedPreferences("chaka.memory.v1", Context.MODE_PRIVATE)
+        .edit().putString(label.lowercase().trim(), value).apply()
+    }
+
+    Function("memoryDelete") { label: String ->
+      context.getSharedPreferences("chaka.memory.v1", Context.MODE_PRIVATE)
+        .edit().remove(label.lowercase().trim()).apply()
+    }
+
     Function("stopLive") {
       currentLive?.stop()
       currentLive = null

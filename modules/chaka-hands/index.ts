@@ -267,3 +267,23 @@ export function sayLive(text: string): void {
 export function isLiveRunning(): boolean {
   return !!Hands?.isLiveRunning?.();
 }
+
+// --- Shared memory (5.11.0+) -----------------------------------------------
+// The same store Live Mode reads and writes, so a value saved by voice is
+// available in chat and the other way round.
+
+export function memoryAll(): Record<string, string> {
+  try {
+    return JSON.parse(Hands?.memoryAll?.() ?? "{}");
+  } catch {
+    return {};
+  }
+}
+
+export function memorySet(label: string, value: string): void {
+  Hands?.memorySet?.(label, value);
+}
+
+export function memoryDelete(label: string): void {
+  Hands?.memoryDelete?.(label);
+}
