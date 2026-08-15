@@ -685,7 +685,13 @@ class ChakaLive(
           val said = heard.lowercase().trim()
           val words = said.split(Regex("\\s+")).size
 
-          if (STOP_WORDS.any { w -> said.contains(w) }) {
+          // A real stop is short and leads with it: "stop", "wait", "no no no".
+          // Words like "don't" turn up constantly inside ordinary instructions -
+          // "don't uninstall it, just remove it from the home screen" froze her
+          // completely and she refused to act on a normal request.
+          val isStop = STOP_WORDS.any { w -> said.startsWith(w) } ||
+            (words <= 6 && STOP_WORDS.any { w -> said.contains(w) })
+          if (isStop) {
             // Stop is enforced here, not left to the model — it ignored spoken
             // stops and kept going with things the user didn't want.
             halted = true
