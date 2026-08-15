@@ -164,6 +164,45 @@ class ChakaAccessibilityService : AccessibilityService() {
     }.getOrDefault(false)
   }
 
+  /**
+   * Press and hold, then drag while still held, then release. This is the only
+   * way to move a home-screen icon or reorder a list: a plain swipe never picks
+   * the item up, so the drag slides the page underneath it instead.
+   */
+  fun longPressDrag(x1: Int, y1: Int, x2: Int, y2: Int, holdMs: Long = 800L, moveMs: Long = 900L): Boolean {
+    val hold = Path().apply { moveTo(x1.toFloat(), y1.toFloat()) }
+    val first = GestureDescription.StrokeDescription(hold, 0L, holdMs, true)
+    val move = Path().apply {
+      moveTo(x1.toFloat(), y1.toFloat())
+      lineTo(x2.toFloat(), y2.toFloat())
+    }
+    val second = first.continueStroke(move, 0L, moveMs, false)
+
+    var ok = false
+    val done = java.util.concurrent.CountDownLatch(1)
+    dispatchGesture(
+      GestureDescription.Builder().addStroke(first).build(),
+      object : GestureResultCallback() {
+        override fun onCompleted(d: GestureDescription?) {
+          // The item is lifted; now move it in the same continuous gesture.
+          ok = dispatchGesture(
+            GestureDescription.Builder().addStroke(second).build(),
+            object : GestureResultCallback() {
+              override fun onCompleted(d2: GestureDescription?) { done.countDown() }
+              override fun onCancelled(d2: GestureDescription?) { done.countDown() }
+            },
+            null
+          )
+          if (!ok) done.countDown()
+        }
+        override fun onCancelled(d: GestureDescription?) { done.countDown() }
+      },
+      null
+    )
+    runCatching { done.await(4, java.util.concurrent.TimeUnit.SECONDS) }
+    return ok
+  }
+
   /** Current clipboard text, so a copy can be verified before it's pasted. */
   fun readClipboard(): String? = runCatching {
     val clip = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager

@@ -424,6 +424,7 @@ class ChakaLive(
       "- A BLANK OR HALF-DRAWN SCREEN MEANS LOADING, NOT FAILURE. Sign-in pages, browsers and anything on a slow connection take a moment. Call wait and look again. NEVER press back on a screen that is still loading - the tap that got you there worked, and going back throws it away and starts you round the loop again.\n" +
       "- CHECKBOXES, RADIO BUTTONS AND SWITCHES: tap the LABEL TEXT beside the control, not the little box. The box itself is often a few pixels and not the clickable node; the row or its text usually is. If tapping the box does nothing, tap the words next to it. An element with a blank label is rarely the right target — prefer the one with readable text.\n" +
       "- IF A TAP CHANGES NOTHING TWICE, THE TARGET IS WRONG, NOT THE AIM. Do not nudge the coordinates by a hair and retry. Read the screen again, pick a DIFFERENT element (the label, the row, the parent), or scroll in case the real control is elsewhere.\n" +
+      "- MOVING AN ICON MEANS PICKING IT UP FIRST: drag with hold:true, from the icon to where it should go. A normal drag does not lift it, so nothing moves however many times you try. If a move does not work, check you are dragging the RIGHT icon - the one named in the request - and that you used hold.\n" +
       "- ON A PICKER WHEEL, TAP THE VALUE — DON'T CHASE IT BY DRAGGING. The nearby values are visible above and below the selected one. If the value you want is on screen, TAP IT DIRECTLY with tap_at; the wheel snaps to it exactly. That is how a person does it, and it lands first time. Only drag when the value is not yet visible, and then only far enough to bring it into view.\n" +
       "- DRAG DISTANCE IS ROUGHLY PROPORTIONAL: on a wheel showing about 5 values at once, one value is only ~0.06 of the screen height. A 0.3 drag moves about five values, so if you are 2 away, drag ~0.12 — not 0.3. Overshooting and coming back repeatedly means your steps are far too big.\n" +
       "- DRAGGING A WHEEL IS A FEEDBACK LOOP, NOT ONE MOVE. Drag a little, LOOK at the value in the screenshot that follows, judge how far is left, then drag again — bigger when far, smaller when close, reversed if you went past it. Repeating an identical drag without reading the value is how 2025 becomes 1926.\n" +
@@ -511,6 +512,7 @@ class ChakaLive(
           .put("to_x", JSONObject().put("type", "number").put("description", "0..1 across"))
           .put("to_y", JSONObject().put("type", "number").put("description", "0..1 down"))
           .put("slow", JSONObject().put("type", "boolean").put("description", "true for a precise, controlled drag (pickers); false/omit for a flick"))
+          .put("hold", JSONObject().put("type", "boolean").put("description", "TRUE to press and hold first, then drag. REQUIRED for moving a home-screen icon, reordering a list, or anything you must pick up before moving. Without it you only scroll the page underneath."))
           .put("expect", JSONObject().put("type", "string").put("description", "REQUIRED. What should change, e.g. 'the year shows 1967'.")),
         listOf("from_x", "from_y", "to_x", "to_y", "expect")
       ))
@@ -1983,14 +1985,21 @@ class ChakaLive(
           JSONObject().put("ok", false)
             .put("error", "drag needs from_x/from_y/to_x/to_y as fractions 0..1 (or pixels within ${w}x${h}).")
         } else {
+          val dsig = "drag:${a.first / 50},${a.second / 50}->${b.first / 50},${b.second / 50}"
+          loopGuard(dump, dsig)?.let { return it }
           // Pickers need a deliberate drag; a fast flick overshoots or gets
           // treated as a page fling instead of moving the control.
-          val dur = if (args.optBoolean("slow", true)) 600L else 220L
-          val ok = service.swipe(a.first, a.second, b.first, b.second, dur)
+          // hold=true picks the item UP first. Moving an icon or reordering a
+          // list needs that; a plain swipe just scrolls the page beneath it.
+          val ok = if (args.optBoolean("hold", false)) {
+            service.longPressDrag(a.first, a.second, b.first, b.second)
+          } else {
+            service.swipe(a.first, a.second, b.first, b.second, if (args.optBoolean("slow", true)) 600L else 220L)
+          }
           withOutcome(
-            dump,
-            "drag:${a.first / 50},${a.second / 50}->${b.first / 50},${b.second / 50}",
+            dump, dsig,
             JSONObject().put("ok", ok).put("from", "${a.first},${a.second}").put("to", "${b.first},${b.second}")
+              .put("held_first", args.optBoolean("hold", false))
           )
         }
       }
