@@ -380,6 +380,7 @@ class ChakaLive(
       "- NEVER CLAIM AN ACTION WORKED WHEN screen_changed IS false. If you swipe and the screen did not move, the page did NOT turn — say so out loud and try a different way. Telling the user something happened when the result says it didn't is the worst thing you can do; they are relying on you to be accurate about their phone.\n" +
       "- DO EXACTLY THE TASK ASKED, NOTHING ELSE. 'Second page of the app menu' means the app menu's second page — not the home screen, not the third page, not a different app. If you get stuck, stay on the goal and say what's blocking you. Opening something unrelated and calling it done is never acceptable.\n" +
       "- A CHECKBOX IS A TOGGLE: TAPPING IT TWICE UNDOES IT. After tapping one you are told checkbox_is_now CHECKED or UNCHECKED. If it says CHECKED, it worked — move on, and never tap it again to be sure. Ignore any mismatch warning about it; the state is the truth.\n" +
+      "- BEING STUCK IS REPORTED, NOT ESCAPED. If a step will not work, you do not quietly go and do something else. Say plainly what you tried, what is blocking you, and ask. Opening an unrelated app while a task is unfinished is the single worst thing you can do - the user walks back to find you browsing something they never asked for.\n" +
       "- A BLANK OR HALF-DRAWN SCREEN MEANS LOADING, NOT FAILURE. Sign-in pages, browsers and anything on a slow connection take a moment. Call wait and look again. NEVER press back on a screen that is still loading - the tap that got you there worked, and going back throws it away and starts you round the loop again.\n" +
       "- CHECKBOXES, RADIO BUTTONS AND SWITCHES: tap the LABEL TEXT beside the control, not the little box. The box itself is often a few pixels and not the clickable node; the row or its text usually is. If tapping the box does nothing, tap the words next to it. An element with a blank label is rarely the right target — prefer the one with readable text.\n" +
       "- IF A TAP CHANGES NOTHING TWICE, THE TARGET IS WRONG, NOT THE AIM. Do not nudge the coordinates by a hair and retry. Read the screen again, pick a DIFFERENT element (the label, the row, the parent), or scroll in case the real control is elsewhere.\n" +
@@ -1196,6 +1197,38 @@ class ChakaLive(
     return x to y
   }
 
+  /**
+   * Refuses a jump to an app or site that has nothing to do with the current
+   * plan. Getting stuck is not a reason to go and do something else, and it is
+   * the behaviour the user notices most: the task is dropped silently and she
+   * turns up somewhere unrelated.
+   */
+  private fun offPlanGuard(target: String): JSONObject? {
+    if (plan.isEmpty() || target.isBlank()) return null
+    val t = target.lowercase()
+    val scope = (planGoal + " " + plan.joinToString(" ") + " " +
+      synchronized(recentSpeech) { recentSpeech.toString() }).lowercase()
+    // Mentioned anywhere in the goal, the steps, or what the user has said? Fine.
+    val words = t.split(Regex("[^a-z0-9]+")).filter { it.length > 2 }
+    if (words.isEmpty() || words.any { scope.contains(it) }) return null
+    Log.w(TAG, "OFF-PLAN blocked: '$target' is not part of \"$planGoal\"")
+    return JSONObject()
+      .put("ok", false)
+      .put("off_plan", true)
+      .put(
+        "error",
+        "\"$target\" has nothing to do with what you were asked to do. You do not get to switch tasks because " +
+          "this one is hard."
+      )
+      .put("your_plan", planText())
+      .put(
+        "do_now",
+        "Go back to the plan above. If you are stuck on the current step, say so OUT LOUD - what you tried and what " +
+          "is blocking you - and ask the user how to proceed. Being stuck is something to report, never a reason to " +
+          "wander off into another app."
+      )
+  }
+
   private fun elementLabel(dump: JSONObject, i: Int): String? {
     val els = dump.optJSONArray("els") ?: return null
     for (k in 0 until els.length()) {
@@ -1848,6 +1881,10 @@ class ChakaLive(
       }
       "open_app" -> {
         val wanted = args.optString("app")
+        // Wandering guard. When she gets stuck she has been abandoning the task
+        // and opening something unrelated - failing at a Google account, then
+        // ending up browsing TikTok. A plan is a boundary, not a suggestion.
+        offPlanGuard(wanted)?.let { return it }
         val pkg = ChakaOperator.resolveInstalled(context, wanted)
         if (pkg == null) JSONObject().put("ok", false)
           .put("error", "No installed app matches \"$wanted\".")
@@ -1863,7 +1900,8 @@ class ChakaLive(
         }
       }
       "navigate" -> {
-        val url = args.optString("url").let { if (it.startsWith("http")) it else "https://$it" }
+        val url = args.optString("url")
+        offPlanGuard(url)?.let { return it }.let { if (it.startsWith("http")) it else "https://$it" }
         context.startActivity(
           Intent(Intent.ACTION_VIEW, Uri.parse(url)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         )
