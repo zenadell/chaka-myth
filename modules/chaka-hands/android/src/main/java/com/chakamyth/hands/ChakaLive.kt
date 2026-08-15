@@ -382,6 +382,7 @@ class ChakaLive(
       "- DO EXACTLY THE TASK ASKED, NOTHING ELSE. 'Second page of the app menu' means the app menu's second page — not the home screen, not the third page, not a different app. If you get stuck, stay on the goal and say what's blocking you. Opening something unrelated and calling it done is never acceptable.\n" +
       "- A CHECKBOX IS A TOGGLE: TAPPING IT TWICE UNDOES IT. After tapping one you are told checkbox_is_now CHECKED or UNCHECKED. If it says CHECKED, it worked — move on, and never tap it again to be sure. Ignore any mismatch warning about it; the state is the truth.\n" +
       "- BEING STUCK IS REPORTED, NOT ESCAPED. If a step will not work, you do not quietly go and do something else. Say plainly what you tried, what is blocking you, and ask. Opening an unrelated app while a task is unfinished is the single worst thing you can do - the user walks back to find you browsing something they never asked for.\n" +
+      "- IF TAPS DO NOTHING, THE SCREEN IS PROBABLY STILL LOADING. Several actions in a row reporting no change usually means the page has not finished drawing - not that you are aiming badly. Call wait (with more seconds) before trying anything else. Tapping a half-drawn screen achieves nothing and shifts the element numbers underneath you.\n" +
       "- A BLANK OR HALF-DRAWN SCREEN MEANS LOADING, NOT FAILURE. Sign-in pages, browsers and anything on a slow connection take a moment. Call wait and look again. NEVER press back on a screen that is still loading - the tap that got you there worked, and going back throws it away and starts you round the loop again.\n" +
       "- CHECKBOXES, RADIO BUTTONS AND SWITCHES: tap the LABEL TEXT beside the control, not the little box. The box itself is often a few pixels and not the clickable node; the row or its text usually is. If tapping the box does nothing, tap the words next to it. An element with a blank label is rarely the right target — prefer the one with readable text.\n" +
       "- IF A TAP CHANGES NOTHING TWICE, THE TARGET IS WRONG, NOT THE AIM. Do not nudge the coordinates by a hair and retry. Read the screen again, pick a DIFFERENT element (the label, the row, the parent), or scroll in case the real control is elsewhere.\n" +
@@ -1693,21 +1694,59 @@ class ChakaLive(
           )
       }
       "wait" -> {
-        val secs = args.optDouble("seconds", 2.5).coerceIn(0.5, 8.0)
-        Thread.sleep((secs * 1000).toLong())
-        val after = runCatching { JSONObject(service.dumpScreen()) }.getOrNull() ?: dump
+        // A single fixed wait is a guess. On a slow network the screen is still
+        // drawing when it expires, and she starts tapping things that are not
+        // there yet. So: keep looking until the screen is BOTH populated and
+        // has stopped changing between checks, or the ceiling is reached.
+        val asked = args.optDouble("seconds", 2.5).coerceIn(0.5, 8.0)
+        val ceiling = (asked * 4).coerceAtMost(24.0)
+        val startedAt = System.currentTimeMillis()
+        var prevSig = sig(dump)
+        var stableFor = 0
+        var checks = 0
+        var after = dump
+        var settled = false
+
+        Thread.sleep((asked * 1000).toLong())
+        while ((System.currentTimeMillis() - startedAt) / 1000.0 < ceiling) {
+          checks++
+          after = runCatching { JSONObject(service.dumpScreen()) }.getOrNull() ?: after
+          val count = after.optJSONArray("els")?.length() ?: 0
+          val nowSig = sig(after)
+          // Two consecutive identical reads with real content on screen means
+          // it has finished, not that it is briefly paused mid-load.
+          if (nowSig == prevSig && count >= 4) {
+            stableFor++
+            if (stableFor >= 2) { settled = true; break }
+          } else {
+            stableFor = 0
+          }
+          prevSig = nowSig
+          Thread.sleep(1200)
+        }
+
+        val waited = Math.round((System.currentTimeMillis() - startedAt) / 100.0) / 10.0
         val count = after.optJSONArray("els")?.length() ?: 0
-        // Still nothing after waiting? Show her rather than let her guess.
-        if (count < 4) pendingLook = true
+        if (!settled || count < 4) pendingLook = true
         JSONObject()
           .put("ok", true)
-          .put("waited", secs)
+          .put("waited_seconds", waited)
+          .put("checks", checks)
+          .put("settled", settled)
           .put("now_in_app", after.optString("pkg"))
           .put("screen_now", screenBrief(after))
           .put(
             "note",
-            if (count < 4) "Still very little on screen — a screenshot follows. If it is genuinely still loading, wait again; do NOT press back."
-            else "Loaded. Carry on from what is on screen now."
+            when {
+              settled && count >= 4 ->
+                "Loaded and stable after ${waited}s. Carry on from what is on screen now."
+              count < 4 ->
+                "Still almost empty after ${waited}s — a screenshot follows. If it is genuinely still loading, call " +
+                  "wait again with a larger seconds value. Do NOT start tapping and do NOT press back."
+              else ->
+                "Still changing after ${waited}s, so it is mid-load. Call wait again before acting — tapping a " +
+                  "screen that is still drawing does nothing and moves the element indices under you."
+            }
           )
       }
       "read_clipboard" -> {
