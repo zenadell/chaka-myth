@@ -379,6 +379,7 @@ class ChakaLive(
       "- IF SOMETHING FAILS OR ERRORS, say so plainly and try another route. A page erroring, a login being cancelled, a step not completing - these are things to report, not to paper over.\n" +
       "- NEVER CLAIM AN ACTION WORKED WHEN screen_changed IS false. If you swipe and the screen did not move, the page did NOT turn — say so out loud and try a different way. Telling the user something happened when the result says it didn't is the worst thing you can do; they are relying on you to be accurate about their phone.\n" +
       "- DO EXACTLY THE TASK ASKED, NOTHING ELSE. 'Second page of the app menu' means the app menu's second page — not the home screen, not the third page, not a different app. If you get stuck, stay on the goal and say what's blocking you. Opening something unrelated and calling it done is never acceptable.\n" +
+      "- A CHECKBOX IS A TOGGLE: TAPPING IT TWICE UNDOES IT. After tapping one you are told checkbox_is_now CHECKED or UNCHECKED. If it says CHECKED, it worked — move on, and never tap it again to be sure. Ignore any mismatch warning about it; the state is the truth.\n" +
       "- CHECKBOXES, RADIO BUTTONS AND SWITCHES: tap the LABEL TEXT beside the control, not the little box. The box itself is often a few pixels and not the clickable node; the row or its text usually is. If tapping the box does nothing, tap the words next to it. An element with a blank label is rarely the right target — prefer the one with readable text.\n" +
       "- IF A TAP CHANGES NOTHING TWICE, THE TARGET IS WRONG, NOT THE AIM. Do not nudge the coordinates by a hair and retry. Read the screen again, pick a DIFFERENT element (the label, the row, the parent), or scroll in case the real control is elsewhere.\n" +
       "- ON A PICKER WHEEL, TAP THE VALUE — DON'T CHASE IT BY DRAGGING. The nearby values are visible above and below the selected one. If the value you want is on screen, TAP IT DIRECTLY with tap_at; the wheel snaps to it exactly. That is how a person does it, and it lands first time. Only drag when the value is not yet visible, and then only far enough to bring it into view.\n" +
@@ -1569,7 +1570,37 @@ class ChakaLive(
         else {
           val label = hit.optString("text", hit.optString("desc", ""))
           loopGuard(dump, "tap:$label")?.let { return it }
+          // A checkbox already in the wanted state must NOT be tapped again -
+          // that turns it back off. She checked the delete-confirmation box,
+          // was told MISMATCH, tapped again to "fix" it, and unchecked it.
+          val isToggle = hit.optBoolean("toggle", false)
+          val wasOn = hit.optBoolean("on", false)
           service.tap(hit.optInt("cx"), hit.optInt("cy"))
+          if (isToggle) {
+            Thread.sleep(350)
+            val fresh = runCatching { JSONObject(service.dumpScreen()) }.getOrNull()
+            val nowOn = fresh?.optJSONArray("els")?.let { els ->
+              (0 until els.length()).map { els.optJSONObject(it) }
+                .firstOrNull { e -> e != null && e.optString("text", e.optString("desc", "")) == label }
+                ?.optBoolean("on", false)
+            }
+            if (nowOn != null) {
+              return JSONObject()
+                .put("ok", true)
+                .put("tapped", label)
+                .put("checkbox_is_now", if (nowOn) "CHECKED" else "UNCHECKED")
+                .put(
+                  "important",
+                  if (nowOn)
+                    "It is CHECKED. That worked — do NOT tap it again, tapping a checked box unchecks it. " +
+                      "Move on to the next thing (usually the Continue/Submit button)."
+                  else
+                    "It is still UNCHECKED, so the tap missed the real control. Try the LABEL TEXT beside it, " +
+                      "or the whole row — not the same point again."
+                )
+                .put("screen_now", screenBrief(fresh))
+            }
+          }
           withOutcome(dump, "tap:$label", JSONObject().put("ok", true).put("tapped", label))
         }
       }
