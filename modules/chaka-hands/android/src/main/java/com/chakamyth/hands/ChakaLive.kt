@@ -148,6 +148,12 @@ class ChakaLive(
   // What the user has said recently. The destructive-action rail consults this
   // so it blocks a runaway agent without blocking the user's own instruction.
   private val recentSpeech = StringBuilder()
+  // THE request currently being worked on. Held separately from conversation
+  // history, because history was letting her drift back into an older task -
+  // asked to move an icon, she went and hunted for wireless debugging from a
+  // previous request, and the off-plan guard allowed it because those words
+  // were still in the transcript.
+  @Volatile private var currentRequest = ""
   // The plan, held natively rather than in the model's head. It's replayed with
   // every action result so a mis-tap or a surprise screen can't make her forget
   // the objective and wander into some unrelated app.
@@ -410,6 +416,8 @@ class ChakaLive(
       "- NEVER CLAIM AN ACTION WORKED WHEN screen_changed IS false. If you swipe and the screen did not move, the page did NOT turn — say so out loud and try a different way. Telling the user something happened when the result says it didn't is the worst thing you can do; they are relying on you to be accurate about their phone.\n" +
       "- DO EXACTLY THE TASK ASKED, NOTHING ELSE. 'Second page of the app menu' means the app menu's second page — not the home screen, not the third page, not a different app. If you get stuck, stay on the goal and say what's blocking you. Opening something unrelated and calling it done is never acceptable.\n" +
       "- A CHECKBOX IS A TOGGLE: TAPPING IT TWICE UNDOES IT. After tapping one you are told checkbox_is_now CHECKED or UNCHECKED. If it says CHECKED, it worked — move on, and never tap it again to be sure. Ignore any mismatch warning about it; the state is the truth.\n" +
+      "- ONE REQUEST AT A TIME, AND IT IS THE LATEST ONE. Every result shows the_request - what the user actually asked for, right now. Read it every time. Older tasks are FINISHED; never drift back into something they asked about earlier, and never do a thing they did not ask for. If you catch yourself somewhere unrelated to the_request, stop, go back, and resume it.\n" +
+      "- NEVER CHANGE A SETTING THAT WAS NOT ASKED FOR. No toggling Bluetooth, Wi-Fi, permissions or anything else because you happen to be on that screen. Only touch what the request needs.\n" +
       "- BEING STUCK IS REPORTED, NOT ESCAPED. If a step will not work, you do not quietly go and do something else. Say plainly what you tried, what is blocking you, and ask. Opening an unrelated app while a task is unfinished is the single worst thing you can do - the user walks back to find you browsing something they never asked for.\n" +
       "- READ THE LIST BEFORE YOU SCROLL. Every result gives you screen_now, the things actually on screen. Check it for what you want BEFORE swiping — scrolling past something that is right in front of you is the clearest possible sign you are not looking, and it is how tasks get lost.\n" +
       "- IF TAPS DO NOTHING, THE SCREEN IS PROBABLY STILL LOADING. Several actions in a row reporting no change usually means the page has not finished drawing - not that you are aiming badly. Call wait (with more seconds) before trying anything else. Tapping a half-drawn screen achieves nothing and shifts the element numbers underneath you.\n" +
@@ -717,6 +725,14 @@ class ChakaLive(
             idleTurns = 0
             autoContinues = 0
             awaitingDoneProof = false
+            // A new request REPLACES the old one. Anything still open from the
+            // previous task is finished as far as she is concerned.
+            if (!isFollowUp(said)) {
+              currentRequest = heard
+              plan.clear(); planStep = 0; planGoal = ""
+              stateActionCount.clear(); triedFromState.clear(); stateVisits.clear()
+              Log.i(TAG, "NEW REQUEST: \"$heard\"")
+            }
           }
 
           synchronized(recentSpeech) {
@@ -1252,8 +1268,7 @@ class ChakaLive(
   private fun offPlanGuard(target: String): JSONObject? {
     if (plan.isEmpty() || target.isBlank()) return null
     val t = target.lowercase()
-    val scope = (planGoal + " " + plan.joinToString(" ") + " " +
-      synchronized(recentSpeech) { recentSpeech.toString() }).lowercase()
+    val scope = (planGoal + " " + plan.joinToString(" ") + " " + currentRequest).lowercase()
     // Mentioned anywhere in the goal, the steps, or what the user has said? Fine.
     val words = t.split(Regex("[^a-z0-9]+")).filter { it.length > 2 }
     if (words.isEmpty() || words.any { scope.contains(it) }) return null
@@ -1314,6 +1329,13 @@ class ChakaLive(
       .put("do_now", "Act on it now — tap_index ${hit.first} — instead of scrolling past it.")
       .put("screen_now", screenBrief(dump))
   }
+
+  /** Corrections and asides continue the current task rather than replacing it. */
+  private fun isFollowUp(said: String): Boolean = listOf(
+    "no ", "not ", "wrong", "instead", "i said", "i meant", "that's not", "thats not",
+    "why", "stop", "wait", "go back", "undo", "try", "again", "keep going", "continue",
+    "yes", "correct", "good", "thank"
+  ).any { said.startsWith(it) || said.contains(" $it") }
 
   private fun elementLabel(dump: JSONObject, i: Int): String? {
     val els = dump.optJSONArray("els") ?: return null
@@ -1495,6 +1517,7 @@ class ChakaLive(
       result.put("note", "This screen exposes almost no elements — a screenshot follows, work from it with tap_at.")
     }
 
+    if (currentRequest.isNotEmpty()) result.put("the_request", currentRequest)
     if (plan.isNotEmpty()) result.put("your_plan", planText())
     if (action == lastActionSig && !changed) sameActionRepeats++ else sameActionRepeats = 0
     lastActionSig = action
@@ -1695,6 +1718,25 @@ class ChakaLive(
           // was told MISMATCH, tapped again to "fix" it, and unchecked it.
           val isToggle = hit.optBoolean("toggle", false)
           val wasOn = hit.optBoolean("on", false)
+          // Changing a setting nobody asked about is never part of a task. She
+          // was asked to move an icon and turned Bluetooth on.
+          if (isToggle && currentRequest.isNotEmpty()) {
+            val req = currentRequest.lowercase()
+            val words = label.lowercase().split(Regex("[^a-z0-9]+")).filter { it.length > 3 }
+            if (words.isNotEmpty() && words.none { req.contains(it) }) {
+              Log.w(TAG, "refusing to toggle \"$label\" — not part of \"$currentRequest\"")
+              return JSONObject()
+                .put("ok", false)
+                .put("off_task", true)
+                .put("the_request", currentRequest)
+                .put(
+                  "error",
+                  "\"$label\" is a setting the user did not mention. They asked: \"$currentRequest\". " +
+                    "Do not change settings that are not part of what was asked."
+                )
+                .put("do_now", "Go back to the actual request. If you are lost, say so and ask.")
+            }
+          }
           service.tap(hit.optInt("cx"), hit.optInt("cy"))
           if (isToggle) {
             Thread.sleep(350)
