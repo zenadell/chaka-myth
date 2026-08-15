@@ -1501,6 +1501,16 @@ class ChakaLive(
   }
 
   private fun withOutcome(before: JSONObject, action: String, result: JSONObject): JSONObject {
+    // Let the UI actually respond before judging it. Reading the screen the
+    // instant a tap fires reported working actions as MISMATCH - she then
+    // "corrected" correct behaviour and looped. Navigation needs longer than a
+    // toggle, so taps and presses get the most.
+    val settle = when {
+      action.startsWith("tap") || action.startsWith("press") || action.startsWith("open") -> 750L
+      action.startsWith("type") || action.startsWith("enter") -> 500L
+      else -> 350L
+    }
+    runCatching { Thread.sleep(settle) }
     Thread.sleep(550)  // let the UI settle
     val after = runCatching { JSONObject(service.dumpScreen()) }.getOrNull() ?: return result
     val changed = sig(after) != sig(before)
