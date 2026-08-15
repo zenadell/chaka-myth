@@ -380,6 +380,7 @@ class ChakaLive(
       "- NEVER CLAIM AN ACTION WORKED WHEN screen_changed IS false. If you swipe and the screen did not move, the page did NOT turn — say so out loud and try a different way. Telling the user something happened when the result says it didn't is the worst thing you can do; they are relying on you to be accurate about their phone.\n" +
       "- DO EXACTLY THE TASK ASKED, NOTHING ELSE. 'Second page of the app menu' means the app menu's second page — not the home screen, not the third page, not a different app. If you get stuck, stay on the goal and say what's blocking you. Opening something unrelated and calling it done is never acceptable.\n" +
       "- A CHECKBOX IS A TOGGLE: TAPPING IT TWICE UNDOES IT. After tapping one you are told checkbox_is_now CHECKED or UNCHECKED. If it says CHECKED, it worked — move on, and never tap it again to be sure. Ignore any mismatch warning about it; the state is the truth.\n" +
+      "- A BLANK OR HALF-DRAWN SCREEN MEANS LOADING, NOT FAILURE. Sign-in pages, browsers and anything on a slow connection take a moment. Call wait and look again. NEVER press back on a screen that is still loading - the tap that got you there worked, and going back throws it away and starts you round the loop again.\n" +
       "- CHECKBOXES, RADIO BUTTONS AND SWITCHES: tap the LABEL TEXT beside the control, not the little box. The box itself is often a few pixels and not the clickable node; the row or its text usually is. If tapping the box does nothing, tap the words next to it. An element with a blank label is rarely the right target — prefer the one with readable text.\n" +
       "- IF A TAP CHANGES NOTHING TWICE, THE TARGET IS WRONG, NOT THE AIM. Do not nudge the coordinates by a hair and retry. Read the screen again, pick a DIFFERENT element (the label, the row, the parent), or scroll in case the real control is elsewhere.\n" +
       "- ON A PICKER WHEEL, TAP THE VALUE — DON'T CHASE IT BY DRAGGING. The nearby values are visible above and below the selected one. If the value you want is on screen, TAP IT DIRECTLY with tap_at; the wheel snaps to it exactly. That is how a person does it, and it lands first time. Only drag when the value is not yet visible, and then only far enough to bring it into view.\n" +
@@ -1647,6 +1648,24 @@ class ChakaLive(
             "next",
             if (planStep >= plan.size) "All steps are done. Verify the goal is truly met, then call task_done."
             else "Now do step ${planStep + 1}: ${plan.getOrNull(planStep)}"
+          )
+      }
+      "wait" -> {
+        val secs = args.optDouble("seconds", 2.5).coerceIn(0.5, 8.0)
+        Thread.sleep((secs * 1000).toLong())
+        val after = runCatching { JSONObject(service.dumpScreen()) }.getOrNull() ?: dump
+        val count = after.optJSONArray("els")?.length() ?: 0
+        // Still nothing after waiting? Show her rather than let her guess.
+        if (count < 4) pendingLook = true
+        JSONObject()
+          .put("ok", true)
+          .put("waited", secs)
+          .put("now_in_app", after.optString("pkg"))
+          .put("screen_now", screenBrief(after))
+          .put(
+            "note",
+            if (count < 4) "Still very little on screen — a screenshot follows. If it is genuinely still loading, wait again; do NOT press back."
+            else "Loaded. Carry on from what is on screen now."
           )
       }
       "read_clipboard" -> {
