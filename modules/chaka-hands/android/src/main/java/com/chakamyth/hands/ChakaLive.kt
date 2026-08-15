@@ -411,6 +411,7 @@ class ChakaLive(
       "- DO EXACTLY THE TASK ASKED, NOTHING ELSE. 'Second page of the app menu' means the app menu's second page — not the home screen, not the third page, not a different app. If you get stuck, stay on the goal and say what's blocking you. Opening something unrelated and calling it done is never acceptable.\n" +
       "- A CHECKBOX IS A TOGGLE: TAPPING IT TWICE UNDOES IT. After tapping one you are told checkbox_is_now CHECKED or UNCHECKED. If it says CHECKED, it worked — move on, and never tap it again to be sure. Ignore any mismatch warning about it; the state is the truth.\n" +
       "- BEING STUCK IS REPORTED, NOT ESCAPED. If a step will not work, you do not quietly go and do something else. Say plainly what you tried, what is blocking you, and ask. Opening an unrelated app while a task is unfinished is the single worst thing you can do - the user walks back to find you browsing something they never asked for.\n" +
+      "- READ THE LIST BEFORE YOU SCROLL. Every result gives you screen_now, the things actually on screen. Check it for what you want BEFORE swiping — scrolling past something that is right in front of you is the clearest possible sign you are not looking, and it is how tasks get lost.\n" +
       "- IF TAPS DO NOTHING, THE SCREEN IS PROBABLY STILL LOADING. Several actions in a row reporting no change usually means the page has not finished drawing - not that you are aiming badly. Call wait (with more seconds) before trying anything else. Tapping a half-drawn screen achieves nothing and shifts the element numbers underneath you.\n" +
       "- A BLANK OR HALF-DRAWN SCREEN MEANS LOADING, NOT FAILURE. Sign-in pages, browsers and anything on a slow connection take a moment. Call wait and look again. NEVER press back on a screen that is still loading - the tap that got you there worked, and going back throws it away and starts you round the loop again.\n" +
       "- CHECKBOXES, RADIO BUTTONS AND SWITCHES: tap the LABEL TEXT beside the control, not the little box. The box itself is often a few pixels and not the clickable node; the row or its text usually is. If tapping the box does nothing, tap the words next to it. An element with a blank label is rarely the right target — prefer the one with readable text.\n" +
@@ -1274,6 +1275,46 @@ class ChakaLive(
       )
   }
 
+  /**
+   * If what she says she's scrolling to find is already on this screen, say so
+   * and stop her. Scrolling past a visible target is one of the easiest ways to
+   * lose a task, and it looks — correctly — like she isn't seeing the screen.
+   */
+  private fun alreadyOnScreen(dump: JSONObject, expect: String): JSONObject? {
+    if (expect.isBlank()) return null
+    val els = dump.optJSONArray("els") ?: return null
+    val labels = (0 until els.length()).mapNotNull { i ->
+      els.optJSONObject(i)?.let { e ->
+        val t = e.optString("text", e.optString("desc", ""))
+        if (t.isBlank()) null else e.optInt("i") to t
+      }
+    }
+    if (labels.isEmpty()) return null
+
+    val want = expect.lowercase()
+      .split(Regex("[^a-z0-9]+"))
+      .filter { it.length > 3 && it !in setOf("the","this","that","with","option","appear","appears","screen","show","shows","button","setting","settings","find","view") }
+    if (want.isEmpty()) return null
+
+    // A visible label containing every meaningful word she's looking for.
+    val hit = labels.firstOrNull { (_, label) ->
+      val l = label.lowercase()
+      want.all { l.contains(it) }
+    } ?: return null
+
+    Log.i(TAG, "refusing scroll — \"${hit.second}\" is already on screen at [${hit.first}]")
+    return JSONObject()
+      .put("ok", false)
+      .put("already_visible", hit.second)
+      .put("index", hit.first)
+      .put(
+        "error",
+        "\"${hit.second}\" is ALREADY on this screen, at index [${hit.first}]. There is nothing to scroll to."
+      )
+      .put("do_now", "Act on it now — tap_index ${hit.first} — instead of scrolling past it.")
+      .put("screen_now", screenBrief(dump))
+  }
+
   private fun elementLabel(dump: JSONObject, i: Int): String? {
     val els = dump.optJSONArray("els") ?: return null
     for (k in 0 until els.length()) {
@@ -1839,6 +1880,10 @@ class ChakaLive(
         val dy = (h * frac).toInt()
         val dir = args.optString("direction", "down")
         loopGuard(dump, "swipe:$dir")?.let { return it }
+        // Refuse to go looking for something that is already here. She swiped up
+        // and down six times hunting for "Wireless debugging" while it sat in
+        // the element list in front of her.
+        alreadyOnScreen(dump, args.optString("expect"))?.let { return it }
         // Horizontal swipes have to be a proper FLING or the page springs back.
         // The old 32%-of-width drag over 300ms was too short and too slow to
         // commit a launcher page — it moved halfway and snapped home, which read
