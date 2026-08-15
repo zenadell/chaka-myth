@@ -143,6 +143,7 @@ class ChakaLive(
   @Volatile private var lastScreenReadAt = 0L
   // How many actions in a row produced no real change. If nothing has moved,
   // the task cannot be finished, whatever she believes.
+  @Volatile private var lastHoldDragAt = 0L
   @Volatile private var noProgressRun = 0
   @Volatile private var pendingExpect = ""
   @Volatile private var lastVerified = false
@@ -431,6 +432,7 @@ class ChakaLive(
       "- A BLANK OR HALF-DRAWN SCREEN MEANS LOADING, NOT FAILURE. Sign-in pages, browsers and anything on a slow connection take a moment. Call wait and look again. NEVER press back on a screen that is still loading - the tap that got you there worked, and going back throws it away and starts you round the loop again.\n" +
       "- CHECKBOXES, RADIO BUTTONS AND SWITCHES: tap the LABEL TEXT beside the control, not the little box. The box itself is often a few pixels and not the clickable node; the row or its text usually is. If tapping the box does nothing, tap the words next to it. An element with a blank label is rarely the right target — prefer the one with readable text.\n" +
       "- IF A TAP CHANGES NOTHING TWICE, THE TARGET IS WRONG, NOT THE AIM. Do not nudge the coordinates by a hair and retry. Read the screen again, pick a DIFFERENT element (the label, the row, the parent), or scroll in case the real control is elsewhere.\n" +
+      "- AFTER MOVING AN ICON, LOOK - NEVER PRESS BACK. Back cancels the move and puts it straight back where it was. If the home screen is in edit mode afterwards, tap an empty part of the screen to settle it.\n" +
       "- MOVING AN ICON MEANS PICKING IT UP FIRST: drag with hold:true, from the icon to where it should go. A normal drag does not lift it, so nothing moves however many times you try. If a move does not work, check you are dragging the RIGHT icon - the one named in the request - and that you used hold.\n" +
       "- ON A PICKER WHEEL, TAP THE VALUE — DON'T CHASE IT BY DRAGGING. The nearby values are visible above and below the selected one. If the value you want is on screen, TAP IT DIRECTLY with tap_at; the wheel snaps to it exactly. That is how a person does it, and it lands first time. Only drag when the value is not yet visible, and then only far enough to bring it into view.\n" +
       "- DRAG DISTANCE IS ROUGHLY PROPORTIONAL: on a wheel showing about 5 values at once, one value is only ~0.06 of the screen height. A 0.3 drag moves about five values, so if you are 2 away, drag ~0.12 — not 0.3. Overshooting and coming back repeatedly means your steps are far too big.\n" +
@@ -2008,6 +2010,7 @@ class ChakaLive(
           // hold=true picks the item UP first. Moving an icon or reordering a
           // list needs that; a plain swipe just scrolls the page beneath it.
           val ok = if (args.optBoolean("hold", false)) {
+            lastHoldDragAt = System.currentTimeMillis()
             service.longPressDrag(a.first, a.second, b.first, b.second)
           } else {
             service.swipe(a.first, a.second, b.first, b.second, if (args.optBoolean("slow", true)) 600L else 220L)
@@ -2151,6 +2154,19 @@ class ChakaLive(
       "end_call" -> JSONObject().put("ok", service.endCall())
       "press_button" -> {
         val b = args.optString("button", "back")
+        // Back right after picking an icon up CANCELS the move. She did this
+        // after every single drag and undid her own work each time.
+        if (b == "back" && System.currentTimeMillis() - lastHoldDragAt < 4000) {
+          Log.w(TAG, "refusing back immediately after a hold-drag")
+          return JSONObject()
+            .put("ok", false)
+            .put(
+              "error",
+              "Pressing back now CANCELS the move you just made. You just dragged something; back throws that away."
+            )
+            .put("do_now", "Look at the screen instead and check whether it landed where you wanted. If the launcher is in edit mode, tap an empty area to finish - never back.")
+            .put("screen_now", screenBrief(dump))
+        }
         loopGuard(dump, "press:$b")?.let { return it }
         withOutcome(dump, "press:$b", JSONObject().put("ok", service.globalAction(b)))
       }

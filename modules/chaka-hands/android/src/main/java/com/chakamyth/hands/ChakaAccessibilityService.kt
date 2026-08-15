@@ -168,8 +168,12 @@ class ChakaAccessibilityService : AccessibilityService() {
    * Press and hold, then drag while still held, then release. This is the only
    * way to move a home-screen icon or reorder a list: a plain swipe never picks
    * the item up, so the drag slides the page underneath it instead.
+   *
+   * The hold is deliberately just past the long-press threshold (~500ms). Held
+   * much longer, a launcher shows its context menu instead of entering drag
+   * mode, and the move never starts.
    */
-  fun longPressDrag(x1: Int, y1: Int, x2: Int, y2: Int, holdMs: Long = 800L, moveMs: Long = 900L): Boolean {
+  fun longPressDrag(x1: Int, y1: Int, x2: Int, y2: Int, holdMs: Long = 550L, moveMs: Long = 900L): Boolean {
     val hold = Path().apply { moveTo(x1.toFloat(), y1.toFloat()) }
     val first = GestureDescription.StrokeDescription(hold, 0L, holdMs, true)
     val move = Path().apply {
