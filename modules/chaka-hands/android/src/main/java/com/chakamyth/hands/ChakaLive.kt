@@ -140,6 +140,9 @@ class ChakaLive(
   @Volatile private var lastRealLookAt = 0L
   @Volatile private var lastCorrectionAt = 0L
   @Volatile private var lastScreenReadAt = 0L
+  // How many actions in a row produced no real change. If nothing has moved,
+  // the task cannot be finished, whatever she believes.
+  @Volatile private var noProgressRun = 0
   @Volatile private var pendingExpect = ""
   @Volatile private var lastVerified = false
   @Volatile private var consecutiveBlocks = 0
@@ -409,6 +412,9 @@ class ChakaLive(
       "- A MISTAKE IS NOT A REASON TO CHANGE THE GOAL. If you tap the wrong thing, go back and get that step right. Never quietly switch to a different app or a different objective; the user asked for one thing.\n" +
       "- WHEN THE USER SAYS STOP, YOU STOP. Stop, wait, don't, cancel — the tools will refuse to act. Acknowledge it, say briefly what you had done, and wait. Never argue or finish the action first.\n" +
       "- COPYING IS NOT VERIFIED UNTIL YOU READ IT BACK. After tapping any Copy button, call read_clipboard before you paste. Copy buttons very often grab the label next to a value rather than the value itself, and pasting a name where a key should be is silent and useless.\n" +
+      "- CLAIMING SUCCESS FALSELY IS THE WORST THING YOU CAN DO. Worse than failing, worse than being slow, worse than asking. The user is relying on you to describe their phone accurately - if you say a thing is done and it is not, they act on something untrue. Before task_done: LOOK, and check the screen actually shows what was asked. If it does not, say so.\n" +
+      "- IF NOTHING HAS CHANGED, NOTHING HAS BEEN ACHIEVED. Several actions in a row with no effect means it did not work - it does not mean it worked quietly. Report that plainly rather than declaring success.\n" +
+      "- REPORT ON WHAT WAS ASKED. If the request named Contacts, your report is about Contacts. Describing a different app is either the wrong action or a wrong description, and both need saying out loud rather than papering over.\n" +
       "- USE YOUR EYES BEFORE SAYING ANYTHING IS DONE. You can SEE — call look_at_screen and actually check. Never say an account is created, a page is open, a message is sent or a task is finished unless you have just looked and can see it. Saying it does not make it so.\n" +
       "- WEB PAGES NEED YOUR EYES. Inside Chrome or any browser the element list is often nearly empty even though the page is full of buttons. If read_screen comes back thin or blank and you're in a browser, call look_at_screen and work from the picture with tap_at.\n" +
       "- A REQUEST WITH SEVERAL PARTS IS NOT DONE UNTIL EVERY PART IS. 'Create an account AND get me the API key' is two things. Track them, finish both, and if you only managed one, say exactly which and why.\n" +
@@ -733,6 +739,7 @@ class ChakaLive(
               currentRequest = heard
               plan.clear(); planStep = 0; planGoal = ""
               stateActionCount.clear(); triedFromState.clear(); stateVisits.clear()
+              noProgressRun = 0
               Log.i(TAG, "NEW REQUEST: \"$heard\"")
             }
           }
@@ -1501,6 +1508,7 @@ class ChakaLive(
     // Compare the outcome against what she said she expected.
     val verdict = verifyEffect(pendingExpect, after, changed, action)
     pendingExpect = ""
+    if (!changed || verdict.optString("effect") == "MISMATCH") noProgressRun++ else noProgressRun = 0
     if (verdict.optString("effect") == "MISMATCH") {
       result.put("verification", verdict)
       lastVerified = false
@@ -2004,6 +2012,56 @@ class ChakaLive(
         }
       }
       "task_done" -> {
+        val summary = args.optString("summary")
+
+        // Nothing has actually changed on screen for several actions. She
+        // dragged the same icon fourteen times, moved nothing, and declared
+        // success twice. A claim cannot outrank the record.
+        if (noProgressRun >= 3) {
+          Log.w(TAG, "task_done REFUSED — $noProgressRun actions with no effect")
+          awaitingDoneProof = false
+          pendingLook = true
+          return JSONObject()
+            .put("ok", false)
+            .put("refused", true)
+            .put("actions_with_no_effect", noProgressRun)
+            .put("the_request", currentRequest)
+            .put(
+              "error",
+              "You cannot mark this done. Your last $noProgressRun actions changed NOTHING on screen — whatever you " +
+                "were trying did not work, so the task is not complete."
+            )
+            .put(
+              "do_now",
+              "A screenshot follows. Look at what is actually there and tell the user the truth: what you tried, that " +
+                "it did not work, and what you think is blocking it. Do not claim success."
+            )
+        }
+
+        // Does the summary even describe the thing that was asked for? She
+        // reported moving Spotify when the request named Contacts.
+        if (currentRequest.isNotEmpty() && summary.isNotEmpty()) {
+          val stop = setOf("the","this","that","with","from","into","your","have","been","moved","move","open","opened","app","apps","screen","home","top","row","next","and","for","you","asked","requested","done","completed","successfully")
+          val reqWords = currentRequest.lowercase().split(Regex("[^a-z0-9]+")).filter { it.length > 3 && it !in stop }
+          val sumLower = summary.lowercase()
+          if (reqWords.isNotEmpty() && reqWords.none { sumLower.contains(it) }) {
+            Log.w(TAG, "task_done REFUSED — summary does not match the request")
+            awaitingDoneProof = false
+            pendingLook = true
+            return JSONObject()
+              .put("ok", false)
+              .put("refused", true)
+              .put("the_request", currentRequest)
+              .put("your_summary", summary)
+              .put(
+                "error",
+                "What you are reporting does not match what was asked. The request was: \"$currentRequest\". " +
+                  "Your summary describes something else entirely."
+              )
+              .put("do_now", "You have done the wrong thing, or described it wrongly. Look at the screen, work out which, and either do the actual request or tell the user plainly what happened.")
+          }
+        }
+
         if (!awaitingDoneProof) {
           // Don't take her word for it. Send the actual screen and make her
           // check every part of the request against it first.
