@@ -1900,8 +1900,9 @@ class ChakaLive(
         }
       }
       "navigate" -> {
-        val url = args.optString("url")
-        offPlanGuard(url)?.let { return it }.let { if (it.startsWith("http")) it else "https://$it" }
+        val raw = args.optString("url")
+        offPlanGuard(raw)?.let { return it }
+        val url = if (raw.startsWith("http")) raw else "https://$raw"
         context.startActivity(
           Intent(Intent.ACTION_VIEW, Uri.parse(url)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         )
