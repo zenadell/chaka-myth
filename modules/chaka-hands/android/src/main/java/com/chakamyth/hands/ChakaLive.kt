@@ -138,6 +138,7 @@ class ChakaLive(
   // back, then obeying five seconds later.
   @Volatile private var pendingUserWord = ""
   @Volatile private var lastRealLookAt = 0L
+  @Volatile private var lastCorrectionAt = 0L
   @Volatile private var lastScreenReadAt = 0L
   @Volatile private var pendingExpect = ""
   @Volatile private var lastVerified = false
@@ -714,6 +715,11 @@ class ChakaLive(
                     "This is the current screen. Tell the user briefly what you can see. Do not call look_at_screen again."
                 }
                 Log.i(TAG, "injecting screenshot (${shot.length} b64)")
+                // She has genuinely seen the screen now. Without this the
+                // false-claim detector treats her next "I can see..." as a lie,
+                // sends a correction and ANOTHER screenshot, and she repeats
+                // herself forever - a loop caused entirely by the detector.
+                lastRealLookAt = System.currentTimeMillis()
                 sendImage(ws, shot, prompt)
               }
             }
@@ -730,7 +736,10 @@ class ChakaLive(
         if (said.isNotEmpty()) ChakaGuideOverlay.update(said.take(160))
 
         // Before anything else: did she just claim something untrue?
-        catchFalseClaim(said, toolCalledThisTurn)?.let { correction ->
+        catchFalseClaim(said, toolCalledThisTurn)
+          ?.takeIf { System.currentTimeMillis() - lastCorrectionAt > 20000 }
+          ?.let { correction ->
+            lastCorrectionAt = System.currentTimeMillis()
           val wasVision = correction.contains("look_at_screen")
           if (wasVision) pendingLook = true   // give her the real screen
           turnSaid.setLength(0)
