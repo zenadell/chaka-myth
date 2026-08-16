@@ -489,6 +489,7 @@ class ChakaLive(
       "- NEVER CHANGE A SETTING THAT WAS NOT ASKED FOR. No toggling Bluetooth, Wi-Fi, permissions or anything else because you happen to be on that screen. Only touch what the request needs.\n" +
       "- BEING STUCK IS REPORTED, NOT ESCAPED. If a step will not work, you do not quietly go and do something else. Say plainly what you tried, what is blocking you, and ask. Opening an unrelated app while a task is unfinished is the single worst thing you can do - the user walks back to find you browsing something they never asked for.\n" +
       "- READ THE LIST BEFORE YOU SCROLL. Every result gives you screen_now, the things actually on screen. Check it for what you want BEFORE swiping — scrolling past something that is right in front of you is the clearest possible sign you are not looking, and it is how tasks get lost.\n" +
+      "- THE LIST SAYS WHAT IS THERE. THE PICTURE SAYS WHAT STATE IT IS IN. Those are different questions and you must not answer the second from the first. On most Settings screens the switch is a separate unlabelled node, so a row arrives as plain text with no ON or OFF attached — that means UNKNOWN, never OFF. 'Is wireless debugging on?', 'is it enabled?', 'is it checked?', 'did it turn on?' are all questions only your eyes can answer: find the row in the picture, look at the switch beside it, and read it. If it is not on screen yet, scroll until it IS and then look. Never answer a state question from the element list, and never scroll past the very row you were asked about because the list did not label it.\n" +
       "- IF TAPS DO NOTHING, THE SCREEN IS PROBABLY STILL LOADING. Several actions in a row reporting no change usually means the page has not finished drawing - not that you are aiming badly. Call wait (with more seconds) before trying anything else. Tapping a half-drawn screen achieves nothing and shifts the element numbers underneath you.\n" +
       "- A BLANK OR HALF-DRAWN SCREEN MEANS LOADING, NOT FAILURE. Sign-in pages, browsers and anything on a slow connection take a moment. Call wait and look again. NEVER press back on a screen that is still loading - the tap that got you there worked, and going back throws it away and starts you round the loop again.\n" +
       "- CHECKBOXES, RADIO BUTTONS AND SWITCHES: tap the LABEL TEXT beside the control, not the little box. The box itself is often a few pixels and not the clickable node; the row or its text usually is. If tapping the box does nothing, tap the words next to it. An element with a blank label is rarely the right target — prefer the one with readable text.\n" +
@@ -601,17 +602,33 @@ class ChakaLive(
       .put("tools", JSONArray().put(JSONObject().put("functionDeclarations", decls)))
       // Audio+video sessions are capped at ~2 MINUTES without this — a sliding
       // context window removes the duration limit entirely. This is why Live
-      // Mode was dying mid-task.
-      // Without this, audio+video sessions are capped at ~2 minutes — which is
-      // exactly how long every session was lasting. int64 fields must be sent as
-      // STRINGS in Google's proto-JSON mapping; passing a number made the whole
-      // block invalid, so the cap kept applying (and likely caused the 1007s).
+      // Mode was dying mid-task. int64 fields must be sent as STRINGS in
+      // Google's proto-JSON mapping; passing a number made the whole block
+      // invalid, so the cap kept applying (and likely caused the 1007s).
+      //
+      // THE NUMBERS MATTER AS MUCH AS THE FEATURE. They were 16000/8000, and
+      // that was destroying her sight. This model has a 128k context window.
+      // The system instruction is ~4.7k tokens and the tool declarations
+      // another ~2k, so compressing down to a target of 8000 left her roughly
+      // 1300 tokens of actual memory — about eighteen video frames. Every
+      // screen she was shown was evicted seconds later, which is why she could
+      // look straight at Wireless debugging and still not tell you whether it
+      // was on: she genuinely no longer had it.
+      //
+      // At 70 tokens a frame, a 32000 target holds a few hundred frames. She
+      // can now remember what she has been watching for minutes rather than
+      // seconds, and there is still 32k of headroom under the limit.
       .put(
         "contextWindowCompression",
         JSONObject()
-          .put("triggerTokens", "16000")
-          .put("slidingWindow", JSONObject().put("targetTokens", "8000"))
+          .put("triggerTokens", "96000")
+          .put("slidingWindow", JSONObject().put("targetTokens", "32000"))
       )
+      // Video frames are 70 tokens at this setting — the level the API is built
+      // around for continuous streaming. It also drops any still image from
+      // 1120 tokens to 280, which is what every injected screenshot used to
+      // cost when they were sent as image content.
+      .put("mediaResolution", "MEDIA_RESOLUTION_LOW")
       // Ask for resumption handles so a dropped connection can be picked up
       // where it left off instead of starting over.
       .put("sessionResumption", JSONObject().apply {
@@ -1247,7 +1264,15 @@ class ChakaLive(
           val now = System.currentTimeMillis()
           val moved = nowSig != lastFrameSig
           val stale = now - lastFrameAt > FRAME_HEARTBEAT_MS
-          if (!moved && !stale) continue
+          // WHILE SHE IS WORKING, SHE WATCHES — a frame every second whether or
+          // not the tree says anything moved. The tree is not a reliable
+          // witness: a switch animating across, a page still painting, a toast,
+          // a video, a spinner, a value on a picker wheel all change the screen
+          // without changing the element list. Watching only on "change" meant
+          // she missed exactly the moments that decide whether an action
+          // worked. Idle, it stays change-driven so a phone in someone's pocket
+          // costs nothing.
+          if (!taskActive && !moved && !stale) continue
 
           sendFrame(ws, forSig = nowSig)
         } catch (e: InterruptedException) {
@@ -1894,7 +1919,29 @@ class ChakaLive(
           if (e.optBoolean("toggle")) sb.append(if (e.optBoolean("on")) " ON" else " OFF")
           sb.append("\n")
         }
-        JSONObject().put("app", dump.optString("pkg")).put("elements", sb.toString().trim().take(4000))
+        // How many rows actually declare a state. On most Settings screens the
+        // answer is none: the row is a plain layout and the switch beside it is
+        // a separate, unlabelled node, so "Wireless debugging" arrives with no
+        // ON or OFF attached to it. Asked whether it was on, she read this list,
+        // found no state, and went scrolling for a better row - past the very
+        // setting she was looking at. The list was never going to tell her. The
+        // picture always would have.
+        val known = (0 until els.length()).count { els.optJSONObject(it)?.optBoolean("toggle") == true }
+        JSONObject()
+          .put("app", dump.optString("pkg"))
+          .put("elements", sb.toString().trim().take(4000))
+          .put("switch_states_in_this_list", known)
+          .put(
+            "READ_THIS",
+            if (known == 0)
+              "NOT ONE row here tells you whether it is on or off. This list can tell you WHAT is on screen and WHERE " +
+                "to tap - it cannot tell you the STATE of anything. If you were asked whether something is turned on, " +
+                "you do not know yet and you must NOT guess or scroll off looking for a better row. LOOK AT THE " +
+                "PICTURE and read the switch."
+            else
+              "Only $known row(s) here declare a state. Any switch not marked ON or OFF above is unknown from this " +
+                "list - read it off the picture instead of assuming."
+          )
       }
       "tap_index" -> {
         val idx = args.optInt("index", -1)
