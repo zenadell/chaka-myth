@@ -1,33 +1,50 @@
 # Chaka-Myth — handoff
 
-## The one job
+## Where this stands (v6.1.0, ebc2b47)
 
-**Make vision mandatory before AND after every action. Accuracy over speed.**
+Vision before and after every action is **built and installed, not yet watched
+running**. Start Live Mode and check the log before trusting it — see
+"Verify this first" below.
 
-This is the owner's top priority and it has been asked for repeatedly. What
-exists today is vision *on failure* — a screenshot is pushed after a MISMATCH,
-after a thin element list, after a blocked action. All reactive. So on a screen
-where the accessibility tree looks healthy she never looks at all: she taps from
-the text list, assumes it worked, and moves on.
+Two faults were found, and they explain the reported failures between them:
 
-That single gap causes the failures being reported:
+1. **`startFrameLoop` was never called.** It had been dead since 834628f while
+   the system instruction told her "frames stream to you" and, after every
+   action, "the next frames show the result". She had no vision at all and had
+   been told twice that she did — which is why she described screens she had
+   never seen.
+2. **Screenshots were sent as `clientContent`.** On the 3.x live models that is
+   only accepted for seeding history before the first model turn; mid-session
+   it is not a way to say anything. The logs show each injection followed
+   ~100ms later by `interrupted by user`, then the same failed tap a second
+   later. 27 of them in four minutes.
 
-- Asked to check whether USB debugging was on, she scrolled past it repeatedly
-  while it sat in the element list in front of her.
-- She toggled Developer options OFF entirely — a blind tap from the tree.
-- Asked for a Google AI Studio API key, she created it, then copied only the
-  last three characters and never noticed.
+Now: frames stream continuously over `realtimeInput.video`, `ensureSeen()`
+guarantees a picture of the screen has left the device before any acting tool
+fires, and `withOutcome` pushes the resulting screen before the tool result
+reaches her. All text goes over `realtimeInput.text`.
 
-## Do this, in order
+## Verify this first
 
-1. **Look before acting.** `tap_index` / `tap_at` should refuse when she has not
-   looked at the *current* screen. There is already a `lastRealLookAt` timestamp
-   and a screen signature to compare against.
-2. **Verify after, from the image** — not from the element list.
-3. **Sanity-check anything copied.** `read_clipboard` exists; an API key is ~39
-   characters, so three characters is obviously wrong and trivially caught.
-4. **Only then** optimise: smaller frames, skip the look on a screen she has
-   already seen unchanged.
+```bash
+adb -s "$PORT" logcat -v time -s ChakaLive:V | grep -E "vision:|look-before-act|rejected|frame loop"
+```
+
+- `vision: N frames streamed` climbing = she can see. If it never appears, she
+  is still blind and nothing else in this file matters.
+- No `rejected (1007)`. If one appears right after a `realtimeInput.text`, the
+  log now says so outright — that would mean the text shape is wrong and
+  `sendText` has to go back to `clientContent`.
+- `injecting screenshot` → `interrupted` → same tap repeated should be gone.
+
+## Still open
+
+- **The drive/nudge/correction pushes were all going down the dead
+  clientContent path too.** They now work for the first time. Watch that she
+  isn't over-driven as a result — the caps (`autoContinues > 30`, `drives >= 50`,
+  `MIN_DRIVE_GAP_MS`) were tuned while those messages were being half-ignored.
+- Only then optimise: smaller frames, longer heartbeat, skipping the pre-action
+  frame on a screen she has already been shown unchanged.
 
 ## State
 

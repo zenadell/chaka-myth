@@ -97,6 +97,10 @@ class ChakaLive(
   // Frames streamed since the session came up — proof for the log that she has
   // vision at all, which for a long time she silently did not.
   @Volatile private var framesSent = 0
+  // When text last went up the realtime stream. Only here so that if the
+  // server ever rejects that message the log says so outright, instead of
+  // leaving the next person to guess the way the last one guessed wrong.
+  @Volatile private var lastTextSentAt = 0L
   @Volatile private var lastMsgAt = 0L
   @Volatile private var connectedAt = 0L
   @Volatile private var attempts = 0
@@ -365,6 +369,10 @@ class ChakaLive(
         // is the one outcome we can't accept. Clear any resumption handle and
         // come back with a clean session after a pause.
         if (code == 1007 || code == 1008) {
+          val sinceText = System.currentTimeMillis() - lastTextSentAt
+          if (lastTextSentAt > 0 && sinceText < 3000) {
+            Log.e(TAG, "REJECTED ${sinceText}ms after a realtimeInput.text — that message shape is the suspect")
+          }
           Log.e(TAG, "rejected ($code): $reason — clean restart in 30s")
           ChakaGuideOverlay.update("Reconnecting in 30s… ($reason)")
           resumeHandle = null
@@ -1278,6 +1286,7 @@ class ChakaLive(
    * the documented one — a plain string, not a Blob.
    */
   private fun sendText(ws: WebSocket, text: String): Boolean = runCatching {
+    lastTextSentAt = System.currentTimeMillis()
     ws.send(JSONObject().put("realtimeInput", JSONObject().put("text", text)).toString())
   }.getOrDefault(false)
 
