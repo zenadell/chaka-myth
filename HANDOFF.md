@@ -74,16 +74,21 @@ Test each guard against **normal speech and normal screens** before adding anoth
 
 Wireless debugging over ADB — no cable (the USB port is dead).
 
+Address it by its **mDNS service name**, which is stable, rather than by IP:port,
+which changes on every reconnect:
+
 ```bash
 export PATH="$PATH:/opt/homebrew/share/android-commandlinetools/platform-tools"
-adb kill-server; adb start-server; sleep 3
-PORT=$(adb mdns services | grep _adb-tls-connect | awk '{print $NF}' | head -1)
-adb connect "$PORT"
+adb devices -l
 ```
 
-The port changes on every reconnect; always rediscover via mDNS. If pairing is
-lost, ask for a fresh code from Settings → Developer options → Wireless debugging
-→ Pair device with pairing code.
+The A05 shows up as `adb-R94XC0DKS0F-wz6HqL._adb-tls-connect._tcp` and that whole
+string works as the `-s` serial. Chasing the rotating port via `adb mdns services`
+is unnecessary and unreliable — and note **`timeout` does not exist on macOS**, so
+any discovery loop built around it fails silently and looks like "phone offline".
+
+If pairing is lost, ask for a fresh code from Settings → Developer options →
+Wireless debugging → Pair device with pairing code.
 
 Build, install, watch:
 
