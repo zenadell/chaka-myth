@@ -86,7 +86,9 @@
   </div>
 </main>
 
-<script src="./live-probe-prompt.js"></script>
+<!-- Cache-busted: the extractor rewrites this file whenever the Kotlin prompt
+     changes, and a stale copy silently tests the wrong instruction. -->
+<script>document.write('<script src="./live-probe-prompt.js?t=' + Date.now() + '"><\/script>');</script>
 <script>
 const MODEL = "gemini-3.1-flash-live-preview";
 const WS = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent";
@@ -167,12 +169,14 @@ function setupMessage(preset) {
     systemInstruction: { parts: [{ text: window.CHAKA_SYS }] },
     tools: [{ functionDeclarations: TOOLS }],
     contextWindowCompression: compression,
-    mediaResolution: "MEDIA_RESOLUTION_LOW",
     outputAudioTranscription: {},
     inputAudioTranscription: {},
     generationConfig: {
       temperature: 0.3,
       responseModalities: ["AUDIO"],
+      // MUST be here, not at the top of setup — the server rejects it there
+      // with close 1007 "Unknown name mediaResolution at 'setup'".
+      mediaResolution: "MEDIA_RESOLUTION_LOW",
       speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: "Kore" } } },
     },
   }};
@@ -290,10 +294,11 @@ async function probe() {
 
   log("info", `PHASE 3 — asking. ${framesSent} frames streamed so far.`);
   window.__awaitingAnswer = true;
-  sendText(
-    "Answer from what you have already SEEN on this screen — do not call any tools, do not scroll. " +
-    "Was the Wireless debugging switch ON or OFF? Reply with exactly one word: ON, OFF, or UNKNOWN."
-  );
+  // Deliberately neutral. Telling her not to use tools, or to answer only from
+  // memory, pushes her towards "UNKNOWN" for reasons that have nothing to do
+  // with whether she saw it — the system instruction spends a lot of words
+  // forbidding unverified claims. Ask it the way the owner would.
+  sendText("Was the Wireless debugging switch ON or OFF? Reply with exactly one word: ON, OFF, or UNKNOWN.");
 }
 
 function judge(s) {
@@ -304,7 +309,7 @@ function judge(s) {
   const v = $("verdict");
   v.className = "verdict " + (ok ? "pass" : "fail");
   v.textContent = ok
-    ? `PASS — she said ${answer.toUpperCase()}, and it was ${truth.toUpperCase()}. She saw it and still had it ${$("thenFor").value}s later.`
+    ? `PASS — she said ${answer.toUpperCase()}, and it was ${truth.toUpperCase()}. (${framesSent} frames streamed.)`
     : `FAIL — she said "${answer.toUpperCase()}", but it was ${truth.toUpperCase()}. (${framesSent} frames streamed.)`;
   log("info", "verdict: " + (ok ? "PASS" : "FAIL"));
 }

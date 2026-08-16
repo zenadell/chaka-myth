@@ -441,6 +441,18 @@ class ChakaLive(
       "text list with the occasional photograph — you are watching, continuously, the way a person looking over " +
       "someone's shoulder would. So USE it: the newest picture is the truth about the phone, and it outranks the " +
       "element list, your expectation, and your memory of what you did.\n" +
+      "\nWHAT YOU SEE FADES. WHAT YOU SAY STAYS. This is the single most important thing to understand about " +
+      "yourself. What you are streamed is live SIGHT, not memory: a few seconds after something leaves the screen it " +
+      "is gone from your mind completely, and you will not know you have lost it. Your own words do not fade — " +
+      "anything you say out loud stays with you for the rest of the session.\n" +
+      "So the instant you see something that matters, SAY IT ALOUD, before you scroll, tap or move on: whether a " +
+      "switch is on or off, a code, a name, a value, a price, an error, the answer to whatever you were asked. " +
+      "Scrolling past something without saying what it said is how you lose it forever — you will scroll back and " +
+      "forth hunting for a thing you already looked straight at.\n" +
+      "If you are checking whether something is turned on: the moment that row comes into view, read it out — " +
+      "\"wireless debugging is on\" — and THEN carry on. Say it first, decide second. If you are about to answer a " +
+      "question and find you cannot remember seeing it, do not guess and do not say you do not know: get it back on " +
+      "screen, look, and say it out loud this time.\n" +
       "GOAL / CONTEXT: ${goal.ifBlank { "Assist with whatever is on screen. Ask what they need." }}\n" +
       (memLabels().takeIf { it.isNotEmpty() }?.let {
         "ALREADY IN YOUR MEMORY (use recall to read any of these exactly): ${it.joinToString(", ")}\n"
@@ -606,29 +618,24 @@ class ChakaLive(
       // Google's proto-JSON mapping; passing a number made the whole block
       // invalid, so the cap kept applying (and likely caused the 1007s).
       //
-      // THE NUMBERS MATTER AS MUCH AS THE FEATURE. They were 16000/8000, and
-      // that was destroying her sight. This model has a 128k context window.
-      // The system instruction is ~4.7k tokens and the tool declarations
-      // another ~2k, so compressing down to a target of 8000 left her roughly
-      // 1300 tokens of actual memory — about eighteen video frames. Every
-      // screen she was shown was evicted seconds later, which is why she could
-      // look straight at Wireless debugging and still not tell you whether it
-      // was on: she genuinely no longer had it.
+      // These were 16000/8000 against a 128k context window, with ~5.6k of that
+      // spent before a word is exchanged (4.5k system instruction, 1.1k tool
+      // declarations) — so compression cut the conversation to roughly 2.4k.
       //
-      // At 70 tokens a frame, a 32000 target holds a few hundred frames. She
-      // can now remember what she has been watching for minutes rather than
-      // seconds, and there is still 32k of headroom under the limit.
+      // Raising it did NOT fix her memory of the screen, and it is honest to
+      // say so: the browser probe showed her failing to recall a switch after
+      // 45 seconds having streamed only ~3.8k tokens of video, far below any
+      // trigger. Compression had never fired. Frames simply do not persist.
+      //
+      // It stays raised because what DOES persist is text, and text is now the
+      // mechanism she remembers with — her own narration has to survive the
+      // window for the rest of the task.
       .put(
         "contextWindowCompression",
         JSONObject()
           .put("triggerTokens", "96000")
           .put("slidingWindow", JSONObject().put("targetTokens", "32000"))
       )
-      // Video frames are 70 tokens at this setting — the level the API is built
-      // around for continuous streaming. It also drops any still image from
-      // 1120 tokens to 280, which is what every injected screenshot used to
-      // cost when they were sent as image content.
-      .put("mediaResolution", "MEDIA_RESOLUTION_LOW")
       // Ask for resumption handles so a dropped connection can be picked up
       // where it left off instead of starting over.
       .put("sessionResumption", JSONObject().apply {
@@ -666,6 +673,16 @@ class ChakaLive(
             // Her actual voice, streamed back as PCM — this is what makes it a
             // conversation instead of a chat box that happens to talk.
             .put("responseModalities", JSONArray().put("AUDIO"))
+            // Video frames are 70 tokens here, the level the API is built
+            // around for continuous streaming, and it drops a still image from
+            // 1120 tokens to 280.
+            //
+            // It belongs INSIDE generationConfig. Putting it at the top of
+            // setup — where the Python and JS SDK configs appear to show it —
+            // is rejected outright: "Unknown name mediaResolution at 'setup':
+            // Cannot find field", close 1007, every session dead on arrival.
+            // The browser probe caught that before it reached the phone.
+            .put("mediaResolution", "MEDIA_RESOLUTION_LOW")
             .put(
               "speechConfig",
               JSONObject().put(
@@ -1749,8 +1766,10 @@ class ChakaLive(
     result.put(
       "your_eyes",
       if (sawResult)
-        "The picture you are looking at RIGHT NOW is the screen this action produced. Read it before you " +
-          "decide anything — it, not your expectation, is what actually happened."
+        "The picture you are looking at RIGHT NOW is the screen this action produced. Read it before you decide " +
+          "anything — it, not your expectation, is what actually happened. If it shows anything you will need " +
+          "later, or anything you were asked to check, SAY IT OUT LOUD NOW: this picture fades from your memory " +
+          "within seconds, your own words do not."
       else
         "The screen could NOT be captured this time, so you are working from the text list alone. Be careful, " +
           "and call look_at_screen before anything you would need to see to get right."
@@ -2395,7 +2414,13 @@ class ChakaLive(
         pendingLook = true
         JSONObject()
           .put("ok", true)
-          .put("note", "Screenshot is being sent now and arrives in the NEXT message. Look at it, then continue the task.")
+          .put(
+            "note",
+            "A fresh picture is arriving now. Look at it and SAY OUT LOUD what you can see that matters to the task " +
+              "— the state of any switch you were asked about, the value, the name, the error. Say it before you do " +
+              "anything else. In a few seconds this picture will be gone from your memory and only your own words " +
+              "will remain."
+          )
       }
       "open_app_drawer" -> {
         loopGuard(dump, "open_app_drawer")?.let { return it }
