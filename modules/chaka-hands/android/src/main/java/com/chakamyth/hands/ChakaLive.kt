@@ -1585,6 +1585,12 @@ class ChakaLive(
     val hit = scored.first to scored.second
 
     Log.i(TAG, "refusing scroll — \"${hit.second}\" is already on screen at [${hit.first}]")
+    // Show her, don't just tell her. She was handed this bare index thirty
+    // times and swiped anyway — reasonably, because the tree splits the row and
+    // the label she gets back ("Debugging") is not the one she is looking for
+    // ("Wireless debugging"). The picture carries the numbered boxes and
+    // settles it.
+    pendingLook = true
     return JSONObject()
       .put("ok", false)
       .put("already_visible", hit.second)
@@ -1986,8 +1992,15 @@ class ChakaLive(
     // the blind tap we are trying to make impossible.
     if (name in TOUCHES_THE_PHONE) ensureSeen(dump)
 
-    // Any action that is not another swipe means she stopped hunting.
-    if (name != "swipe") { huntFor = ""; huntSwipes = 0 }
+    // Only DOING something ends a hunt. Looking does not.
+    //
+    // This said `name != "swipe"`, and read_screen is not a swipe, so the tool
+    // order on the phone came out as a perfect cycle: swipe swipe swipe swipe
+    // read_screen, swipe swipe swipe swipe read_screen, forever. The block at 4
+    // fired every time, was reset every time, and the halt at 8 was unreachable.
+    // A guard whose own advice — "stop and look at the screen" — disarms it is
+    // not a guard.
+    if (name in TOUCHES_THE_PHONE && name != "swipe") { huntFor = ""; huntSwipes = 0 }
 
     return when (name) {
       "read_screen" -> {
