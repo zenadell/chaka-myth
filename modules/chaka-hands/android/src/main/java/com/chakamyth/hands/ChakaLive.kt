@@ -450,9 +450,14 @@ class ChakaLive(
       "Scrolling past something without saying what it said is how you lose it forever — you will scroll back and " +
       "forth hunting for a thing you already looked straight at.\n" +
       "If you are checking whether something is turned on: the moment that row comes into view, read it out — " +
-      "\"wireless debugging is on\" — and THEN carry on. Say it first, decide second. If you are about to answer a " +
-      "question and find you cannot remember seeing it, do not guess and do not say you do not know: get it back on " +
-      "screen, look, and say it out loud this time.\n" +
+      "\"wireless debugging is on\" — and THEN carry on. Say it first, decide second.\n" +
+      // This sentence used to forbid guessing AND forbid saying you don't know,
+      // which between them left no answer she was allowed to give: in testing
+      // she sat silent for four minutes rather than reply, while the session
+      // was demonstrably alive. Never write a rule that closes every door.
+      "And if you are asked something you no longer remember seeing, say so in one short sentence and go and look " +
+      "again — never invent an answer, and NEVER go silent. Saying \"let me check\" costs a second; saying nothing " +
+      "at all leaves them talking to a machine that has stopped responding.\n" +
       "GOAL / CONTEXT: ${goal.ifBlank { "Assist with whatever is on screen. Ask what they need." }}\n" +
       (memLabels().takeIf { it.isNotEmpty() }?.let {
         "ALREADY IN YOUR MEMORY (use recall to read any of these exactly): ${it.joinToString(", ")}\n"
@@ -1281,15 +1286,22 @@ class ChakaLive(
           val now = System.currentTimeMillis()
           val moved = nowSig != lastFrameSig
           val stale = now - lastFrameAt > FRAME_HEARTBEAT_MS
-          // WHILE SHE IS WORKING, SHE WATCHES — a frame every second whether or
-          // not the tree says anything moved. The tree is not a reliable
-          // witness: a switch animating across, a page still painting, a toast,
-          // a video, a spinner, a value on a picker wheel all change the screen
-          // without changing the element list. Watching only on "change" meant
-          // she missed exactly the moments that decide whether an action
-          // worked. Idle, it stays change-driven so a phone in someone's pocket
-          // costs nothing.
-          if (!taskActive && !moved && !stale) continue
+          // ON CHANGE ONLY. Never stream at a steady 1 FPS "so she is always
+          // watching" — that was tried and it does not make her attentive, it
+          // makes her mute.
+          //
+          // Measured, not assumed. Identical question, identical 45s gap, same
+          // prompt: with ~7 change-driven frames she answered correctly in four
+          // seconds; with ~55 frames at 1 FPS she failed, then stopped
+          // responding altogether — she would not even answer "say the word
+          // HELLO" while the socket was open and frames were still going up.
+          //
+          // 834628f said this three months ago ("injecting input constantly
+          // disrupted turn-taking") and I talked myself out of it because the
+          // same commits were also flooding the uplink. The uplink was a
+          // separate bug. This one is real: a frame is an input, and a model
+          // buried in inputs stops producing turns.
+          if (!moved && !stale) continue
 
           sendFrame(ws, forSig = nowSig)
         } catch (e: InterruptedException) {
