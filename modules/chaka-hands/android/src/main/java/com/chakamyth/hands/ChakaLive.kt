@@ -89,6 +89,14 @@ class ChakaLive(
   // independently of the socket callbacks and forces a reconnect.
   private val frameLock = Object()
   @Volatile private var lastFrameAt = 0L
+  // WHICH screen the last delivered frame actually showed. This is the whole
+  // basis of "look before you act": the native side knows what it has put in
+  // front of her, so an action can be gated on her having been shown THIS
+  // screen rather than on her claiming she looked.
+  @Volatile private var lastFrameSig = ""
+  // Frames streamed since the session came up — proof for the log that she has
+  // vision at all, which for a long time she silently did not.
+  @Volatile private var framesSent = 0
   @Volatile private var lastMsgAt = 0L
   @Volatile private var connectedAt = 0L
   @Volatile private var attempts = 0
@@ -188,20 +196,34 @@ class ChakaLive(
     private const val CHAKA_PKG = "com.chakamyth.app"
     private const val WS =
       "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
-    // The Live API accepts image input at <= 1 FPS, which happens to match
-    // Android's accessibility-screenshot rate limit. ~1.4s is a safe cadence.
-    private const val FRAME_MS = 1200L
+    // How often the loop CHECKS whether the screen moved. The check is a cheap
+    // accessibility dump, not a screenshot — only a real change spends a frame.
+    private const val FRAME_MS = 500L
     private const val MIC_RATE = 16000   // required input rate
     // Frames are ~5x the cost of audio on the uplink. Small and throttled.
     private const val LIVE_FRAME_WIDTH = 760
     private const val LIVE_FRAME_QUALITY = 55
-    private const val MIN_FRAME_GAP_MS = 1500L
+    // The Live API accepts video at <= 1 FPS, which also happens to be roughly
+    // Android's accessibility-screenshot rate limit. Never go faster.
+    private const val MIN_FRAME_GAP_MS = 1100L
+    // A frame older than this, or of a different screen, no longer shows her
+    // where she is — so anything about to act re-sends first.
+    private const val FRAME_FRESH_MS = 5000L
+    // Re-send an unchanged screen this often so it stays near the front of her
+    // context instead of scrolling out of the sliding window.
+    private const val FRAME_HEARTBEAT_MS = 9000L
     // Hard floor between drive prods. A screen signature can't be trusted to
     // rate-limit them: anything animated (a recording timer, a video, a
     // spinner) changes every frame, so the loop fired four turns in five
     // seconds and choked the session.
     private const val MIN_DRIVE_GAP_MS = 12000L
     private const val OUT_RATE = 24000   // model's audio output rate
+    // Tools that actually move something on the phone. These are the ones that
+    // must never fire against a screen she has not been shown.
+    private val TOUCHES_THE_PHONE = setOf(
+      "tap_index", "tap_at", "long_press_at", "type_text", "press_enter",
+      "swipe", "drag", "press_button", "open_app", "open_app_drawer", "navigate"
+    )
     // A halt: unambiguous, and fine as an opener.
     private val STOP_WORDS = listOf("stop", "wait", "cancel", "abort", "hold on", "quit")
     // A prohibition. "Don't create a new one, copy the one from before" is an
@@ -273,6 +295,20 @@ class ChakaLive(
             reconnect("went quiet")
             continue
           }
+          // Blindness watchdog. She shipped blind for weeks and nothing could
+          // tell: the frame loop existed, nothing called it, and the system
+          // instruction cheerfully told her frames were streaming. So the loop
+          // is now checked for a pulse rather than trusted to have one.
+          //
+          // Liveness, not silence, is the test. A long gap between frames is
+          // normal — a still screen costs nothing, and the loop deliberately
+          // sends nothing while Chaka's own UI is in front.
+          if (ready && frameThread?.isAlive != true) {
+            Log.w(TAG, "frame loop is not running (sent=$framesSent) — she is blind, restarting it")
+            frameThread = null
+            socket?.let { startFrameLoop(it) }
+          }
+
           // Socket opened but setup never completed (bad handle, quota, etc).
           if (!ready && connectedAt > 0 && now - connectedAt > 20000) {
             Log.w(TAG, "setup never completed after ${(now - connectedAt) / 1000}s")
@@ -391,7 +427,12 @@ class ChakaLive(
   private fun setupMessage(goal: String, model: String): JSONObject {
     val sys =
       "You are Chaka, watching your owner's Android screen live and helping in real time. " +
-      "You can SEE the screen (frames stream to you) and you can ACT on it with the provided tools.\n" +
+      "You can SEE the screen and you can ACT on it with the provided tools.\n" +
+      "\nYOUR EYES ARE ALWAYS OPEN. The phone streams you a picture every time the screen changes, a fresh one " +
+      "immediately BEFORE each action you take, and another immediately AFTER it lands. You are not working from a " +
+      "text list with the occasional photograph — you are watching, continuously, the way a person looking over " +
+      "someone's shoulder would. So USE it: the newest picture is the truth about the phone, and it outranks the " +
+      "element list, your expectation, and your memory of what you did.\n" +
       "GOAL / CONTEXT: ${goal.ifBlank { "Assist with whatever is on screen. Ask what they need." }}\n" +
       (memLabels().takeIf { it.isNotEmpty() }?.let {
         "ALREADY IN YOUR MEMORY (use recall to read any of these exactly): ${it.joinToString(", ")}\n"
@@ -411,11 +452,11 @@ class ChakaLive(
       "- If the connection drops (they may be on a call), pick straight back up when you return — say you're back and resume any unfinished task.\n" +
       "- OBSTACLES ARE YOURS TO CLEAR, not theirs. Permission dialogs (Allow / While using the app), cookie or consent banners, ads, 'Not now', update prompts, rating popups — deal with them yourself the instant they appear: accept what the task needs, dismiss or close anything it doesn't. Never stop and stare at a popup waiting for instructions.\n" +
       "- SWIPE MEANS CONTENT, NOT FINGER. 'down' reveals what is FURTHER DOWN the page; 'up' goes back toward the TOP. Never swipe to reach the app drawer or notifications — use open_app_drawer or press_button instead, so you can't land in the wrong place.\n" +
-      "\nYOU CANNOT FAKE PERCEPTION. The system knows exactly which tools you called. If you say you can see the screen without having called look_at_screen or read_screen, or say you did something without calling the tool, you WILL be caught and corrected in front of the user. Describing a screen you did not look at is inventing it — you have no idea what is there until you call the tool. Look first, speak second.\n" +
+      "\nYOU CANNOT FAKE PERCEPTION. The system knows exactly what it has shown you and which tools you called. You can see the screen, so there is never an excuse for describing it wrongly — but describing it from memory, or from what you assume your last action did, is inventing it just the same. Say what is in the newest picture. And saying you did something without calling the tool will be caught and corrected in front of the user.\n" +
       "\nHOW YOU WORK — LOOK, ACT, CHECK. This is the loop, every step, without exception:\n" +
-      "  1. KNOW WHERE YOU ARE. Read the screen (or look_at_screen if the element list is thin or you are in a browser). Never act on a screen you have not examined this turn.\n" +
+      "  1. KNOW WHERE YOU ARE, BY LOOKING. A picture of the screen you are about to act on has just been sent to you. Look at it. Read it against the element list — if they disagree, the picture is right. Never act on a screen you have not actually looked at.\n" +
       "  2. ACT, AND SAY WHAT YOU EXPECT. Every action takes an 'expect' — what the screen should look like afterwards. Be specific and concrete ('the Connections screen opens', 'the field reads golden brown'), because it is compared against the real screen.\n" +
-      "  3. CHECK WHAT ACTUALLY HAPPENED. The result carries a 'verification'. 'as_expected' means carry on. 'MISMATCH' means you were WRONG about what that action would do — a screenshot follows, look at it, work out where you really are, and fix THAT step. Never continue as though it worked.\n" +
+      "  3. CHECK WHAT ACTUALLY HAPPENED, WITH YOUR EYES. The picture you are looking at is the screen the action produced — it arrives before the result does. Compare it to what you expected. The result also carries a 'verification': 'as_expected' means carry on, 'MISMATCH' means you were WRONG about what that action would do, so work out from the picture where you really are and fix THAT step. Never continue as though it worked.\n" +
       "  4. Only then call step_done. It is refused if nothing was verified.\n" +
       "This loop is what makes you accurate. Skipping the check is how you end up insisting something happened when it did not.\n" +
       "- PLAN BEFORE YOU ACT. Anything with more than one step: call set_plan first with the goal and the ordered steps. The plan is saved and handed back to you after EVERY action, so check it each time — it is what keeps you on the objective when something unexpected happens.\n" +
@@ -516,7 +557,7 @@ class ChakaLive(
       ))
       .put(fn(
         "look_at_screen",
-        "Take a picture of the screen and look at it with your own eyes. Use this when read_screen isn't enough — web pages, photos, galleries, games, custom or image-based UI, or when you need to judge how something LOOKS. The image arrives in the next message.",
+        "Stop and study the screen properly. You are already being streamed a picture continuously, so use this only when you need a deliberate close look — reading small text, judging how something LOOKS, finding a control the element list does not mention, or checking a claim before you make it. A fresh picture arrives immediately.",
         JSONObject()
       ))
       .put(fn(
@@ -655,8 +696,11 @@ class ChakaLive(
         val am = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
         am.mode = AudioManager.MODE_IN_COMMUNICATION
       }
+      lastFrameSig = ""   // a resumed session has shown the new socket nothing
+      framesSent = 0
       startPlayer()
       startMic(ws)
+      startFrameLoop(ws)
       startDriveLoop(ws)
       return
     }
@@ -819,6 +863,7 @@ class ChakaLive(
           Thread {
             Thread.sleep(450)  // let the screen settle
             if (!cancelled && ready) {
+              val nowSig = runCatching { sig(JSONObject(service.dumpScreen())) }.getOrDefault("")
               captureBlocking()?.let { shot ->
                 val prompt = when {
                   awaitingDoneProof ->
@@ -833,13 +878,13 @@ class ChakaLive(
                   else ->
                     "This is the current screen. Tell the user briefly what you can see. Do not call look_at_screen again."
                 }
-                Log.i(TAG, "injecting screenshot (${shot.length} b64)")
-                // She has genuinely seen the screen now. Without this the
-                // false-claim detector treats her next "I can see..." as a lie,
-                // sends a correction and ANOTHER screenshot, and she repeats
-                // herself forever - a loop caused entirely by the detector.
-                lastRealLookAt = System.currentTimeMillis()
-                sendImage(ws, shot, prompt)
+                Log.i(TAG, "showing screen (${shot.length} b64) + prompt")
+                // emitFrame is what marks her as having seen it. Without that
+                // the false-claim detector treats her next "I can see..." as a
+                // lie, sends a correction and ANOTHER screenshot, and she
+                // repeats herself forever - a loop caused entirely by the
+                // detector.
+                showScreen(ws, shot, nowSig, prompt)
               }
             }
           }.also { it.isDaemon = true }.start()
@@ -1166,27 +1211,37 @@ class ChakaLive(
     }.also { it.isDaemon = true; it.start() }
   }
 
-  /** Streams screen frames, but only when the screen actually changed — a still
-   *  screen costs no data, which matters on mobile. */
+  /**
+   * Continuous vision — the thing that makes her an assistant watching a screen
+   * rather than one guessing at a text list.
+   *
+   * This loop was written, then switched off, and for a long time nothing
+   * called it while the system instruction went on telling her "frames stream
+   * to you". She was blind and had been told she could see, which is the
+   * shortest possible description of every failure in the handoff.
+   *
+   * It is cheap because the CHECK is not the FRAME: twice a second it compares
+   * a cheap accessibility dump, and only a screen that actually moved spends a
+   * ~65KB JPEG. A phone sitting still costs nothing at all, and the 1 FPS
+   * ceiling is enforced in sendFrame for everyone.
+   */
   private fun startFrameLoop(ws: WebSocket) {
     if (frameThread != null) return
     frameThread = Thread {
-      var lastSig = ""
-      var lastSentAt = 0L
       while (!cancelled && ready) {
         try {
           Thread.sleep(FRAME_MS)
           val dump = runCatching { JSONObject(service.dumpScreen()) }.getOrNull()
+          // Chaka's own UI is not the screen she is working on.
           if (dump == null || dump.optString("pkg") == CHAKA_PKG) continue
 
-          val sig = dump.optJSONArray("els")?.toString()?.hashCode()?.toString() ?: ""
+          val nowSig = sig(dump)
           val now = System.currentTimeMillis()
-          // Resend at least every ~8s so the model keeps its bearings.
-          if (sig == lastSig && now - lastSentAt < 8000L) continue
-          lastSig = sig
-          lastSentAt = now
+          val moved = nowSig != lastFrameSig
+          val stale = now - lastFrameAt > FRAME_HEARTBEAT_MS
+          if (!moved && !stale) continue
 
-          if (!sendFrame(ws)) continue
+          sendFrame(ws, forSig = nowSig)
         } catch (e: InterruptedException) {
           return@Thread
         } catch (e: Exception) {
@@ -1207,80 +1262,114 @@ class ChakaLive(
    * roughly a fifth as much and are rate-limited.
    */
   /**
-   * Sends a text turn. This MUST be clientContent, not realtimeInput — the
-   * latter is for streaming media only, and pushing text through it is what was
-   * killing sessions: every death in the logs followed a drive/nudge, which
-   * were the only places text was sent. The server answered with close 1007
-   * ("invalid argument") or simply stopped responding.
+   * Sends text into the live conversation.
+   *
+   * This MUST be realtimeInput, not clientContent. On the Gemini 3.x live
+   * models clientContent is accepted only for seeding history before the first
+   * model turn (and only with historyConfig.initialHistoryInClientContent set);
+   * mid-session it is not a supported way to say anything. Everything the
+   * native side pushes — drives, nudges, corrections, the prompt that goes with
+   * a screenshot — was going down that path, which is why those messages landed
+   * as an interruption she then talked straight over.
+   *
+   * It was previously blamed for the 1007s and moved to clientContent. That was
+   * a misread: the same commits also sent a ~250KB frame immediately before
+   * every one of those messages, and the frame was the flood. The shape here is
+   * the documented one — a plain string, not a Blob.
    */
   private fun sendText(ws: WebSocket, text: String): Boolean = runCatching {
-    ws.send(
-      JSONObject().put(
-        "clientContent",
-        JSONObject()
-          .put(
-            "turns",
-            JSONArray().put(
-              JSONObject()
-                .put("role", "user")
-                .put("parts", JSONArray().put(JSONObject().put("text", text)))
-            )
-          )
-          .put("turnComplete", true)
-      ).toString()
-    )
+    ws.send(JSONObject().put("realtimeInput", JSONObject().put("text", text)).toString())
   }.getOrDefault(false)
 
   /**
-   * Sends the screenshot the way a content turn must be sent: clientContent
-   * with inline_data AND a text prompt, turn_complete. A bare realtimeInput
-   * video frame mid-turn gave her nothing to act on — she'd call
-   * look_at_screen twice and then sit there having seen nothing.
+   * Puts the screen in front of her AND makes her deal with it: the frame goes
+   * up the video stream, the prompt up the text stream, which commits a turn.
+   *
+   * This used to be one clientContent turn carrying inline_data and the text
+   * together. On this model that is not a supported mid-session message: the
+   * logs show every injection followed within ~100ms by "interrupted", then the
+   * same failed tap repeated a second later. She was being interrupted by an
+   * image she never received — 27 of them in one four-minute recording, while
+   * the user was asking out loud "can't you use your vision?".
    */
-  private fun sendImage(ws: WebSocket, b64: String, prompt: String): Boolean = runCatching {
-    ws.send(
-      JSONObject().put(
-        "clientContent",
-        JSONObject()
-          .put(
-            "turns",
-            JSONArray().put(
-              JSONObject().put("role", "user").put(
-                "parts",
-                JSONArray()
-                  .put(
-                    JSONObject().put(
-                      "inline_data",
-                      JSONObject().put("mime_type", "image/jpeg").put("data", b64)
-                    )
-                  )
-                  .put(JSONObject().put("text", prompt))
-              )
-            )
-          )
-          .put("turnComplete", true)
-      ).toString()
-    )
-  }.getOrDefault(false)
+  private fun showScreen(ws: WebSocket, b64: String, forSig: String, prompt: String): Boolean {
+    if (!emitFrame(ws, b64, forSig)) return false
+    return sendText(ws, prompt)
+  }
 
-  private fun sendFrame(ws: WebSocket, force: Boolean = false): Boolean {
-    val now = System.currentTimeMillis()
-    synchronized(frameLock) {
-      if (!force && now - lastFrameAt < MIN_FRAME_GAP_MS) return false
-      lastFrameAt = now
-    }
-    val shot = captureBlocking() ?: return false
-    return runCatching {
+  /**
+   * The ONE place a JPEG goes out, and the only thing that may claim she has
+   * seen a screen. Everything downstream — the action gate, the false-claim
+   * detector — trusts lastFrameSig, so nothing else is allowed to set it.
+   */
+  private fun emitFrame(ws: WebSocket, b64: String, forSig: String): Boolean {
+    val sent = runCatching {
       ws.send(
         JSONObject().put(
           "realtimeInput",
-          JSONObject().put("video", JSONObject().put("mimeType", "image/jpeg").put("data", shot))
+          JSONObject().put("video", JSONObject().put("mimeType", "image/jpeg").put("data", b64))
         ).toString()
       )
     }.getOrDefault(false)
+    if (sent) {
+      lastFrameSig = forSig
+      lastFrameAt = System.currentTimeMillis()
+      lastRealLookAt = lastFrameAt   // she has genuinely been shown this screen
+      framesSent++
+      if (framesSent % 10 == 1) Log.i(TAG, "vision: $framesSent frames streamed (${b64.length} b64 each)")
+    }
+    return sent
   }
 
-  private fun captureBlocking(): String? {
+  private fun sendFrame(
+    ws: WebSocket,
+    force: Boolean = false,
+    forSig: String = "",
+    timeoutMs: Long = 4000
+  ): Boolean {
+    val now = System.currentTimeMillis()
+    synchronized(frameLock) {
+      // The 1 FPS ceiling is the API's and Android's both — never breach it,
+      // whoever is asking. A caller that can't have a frame this instant is
+      // told so and carries on with the one already delivered.
+      if (!force && now - lastFrameAt < MIN_FRAME_GAP_MS) return false
+      lastFrameAt = now
+    }
+    val shot = captureBlocking(timeoutMs) ?: return false
+    val sig = forSig.ifBlank {
+      runCatching { sig(JSONObject(service.dumpScreen())) }.getOrDefault("")
+    }
+    return emitFrame(ws, shot, sig)
+  }
+
+  /**
+   * LOOK BEFORE YOU ACT. Guarantees that a picture of the screen she is about
+   * to act on has actually reached her, and returns false only when the device
+   * could not produce one.
+   *
+   * Almost always free: the streaming loop has usually sent this exact screen
+   * already, so this is a signature comparison and nothing more. It spends a
+   * capture only when she is about to act on a screen she has not been shown —
+   * which is precisely the case that produced every failure in the handoff: the
+   * blind tap from the element list that toggled Developer options off, the
+   * scrolling past a setting sitting in front of her.
+   */
+  private fun ensureSeen(dump: JSONObject): Boolean {
+    val ws = socket ?: return false
+    val want = sig(dump)
+    val now = System.currentTimeMillis()
+    if (want.isNotEmpty() && want == lastFrameSig && now - lastFrameAt < FRAME_FRESH_MS) return true
+    Log.i(TAG, "look-before-act: screen not yet shown to her, sending a frame first")
+    return sendFrame(ws, force = true, forSig = want, timeoutMs = 1600)
+  }
+
+  /**
+   * [timeoutMs] matters because the before/after frames are captured on the
+   * websocket's reader thread — the same thread that carries her voice. A slow
+   * capture there is a stutter in her speech, so the paths around an action
+   * give up quickly and say they saw nothing rather than hold the audio up.
+   */
+  private fun captureBlocking(timeoutMs: Long = 4000): String? {
     var result: String? = null
     val lock = Object()
     var done = false
@@ -1290,9 +1379,9 @@ class ChakaLive(
       synchronized(lock) { result = b64; done = true; lock.notifyAll() }
     }
     synchronized(lock) {
-      val deadline = System.currentTimeMillis() + 4000
+      val deadline = System.currentTimeMillis() + timeoutMs
       while (!done && System.currentTimeMillis() < deadline) {
-        runCatching { lock.wait(500) }
+        runCatching { lock.wait(250) }
       }
     }
     return result
@@ -1570,10 +1659,17 @@ class ChakaLive(
       else -> 350L
     }
     runCatching { Thread.sleep(settle) }
-    Thread.sleep(550)  // let the UI settle
+    Thread.sleep(350)
     val after = runCatching { JSONObject(service.dumpScreen()) }.getOrNull() ?: return result
     val changed = sig(after) != sig(before)
     val app = after.optString("pkg")
+
+    // LOOK AFTER YOU ACT. The result of the action goes up the video stream
+    // before this tool result reaches her, so by the time she reads "it
+    // changed" she is already looking at what it changed into. The capture
+    // takes roughly the 200ms that used to be dead sleep here, so verification
+    // costs no more than the wait it replaced.
+    val sawResult = socket?.let { sendFrame(it, force = true, forSig = sig(after), timeoutMs = 1600) } ?: false
 
     consecutiveBlocks = 0
 
@@ -1616,6 +1712,15 @@ class ChakaLive(
     }
 
     result.put("screen_changed", changed).put("now_in_app", app).put("screen_now", screenBrief(after))
+    result.put(
+      "your_eyes",
+      if (sawResult)
+        "The picture you are looking at RIGHT NOW is the screen this action produced. Read it before you " +
+          "decide anything — it, not your expectation, is what actually happened."
+      else
+        "The screen could NOT be captured this time, so you are working from the text list alone. Be careful, " +
+          "and call look_at_screen before anything you would need to see to get right."
+    )
     if (!changed) {
       result.put(
         "warning",
@@ -1756,6 +1861,14 @@ class ChakaLive(
     }
     val dump = runCatching { JSONObject(service.dumpScreen()) }.getOrNull()
       ?: return JSONObject().put("error", "couldn't read the screen")
+
+    // LOOK BEFORE YOU ACT — for real, not as an instruction she may ignore.
+    // Nothing touches the phone until a picture of the screen being acted on
+    // has left the device. The streaming loop has usually sent it already, so
+    // this normally costs a string comparison; it spends a capture only when
+    // she is about to act on something she has not been shown, which is exactly
+    // the blind tap we are trying to make impossible.
+    if (name in TOUCHES_THE_PHONE) ensureSeen(dump)
 
     return when (name) {
       "read_screen" -> {
@@ -1986,7 +2099,7 @@ class ChakaLive(
         if (clip.isNullOrBlank()) {
           JSONObject().put("ok", false).put("error", "The clipboard is empty — the copy did not work.")
         } else {
-          JSONObject()
+          val res = JSONObject()
             .put("ok", true)
             .put("clipboard", clip.take(400))
             .put("length", clip.length)
@@ -1995,6 +2108,27 @@ class ChakaLive(
               "Is this actually the value you meant to copy? A key or token is a long string of random characters — " +
                 "if this looks like a label or a name instead, the copy grabbed the wrong thing, so go back and copy properly."
             )
+          // She copied a Google AI Studio API key once and got three characters
+          // of it, then handed those over as the key. A secret has a shape, and
+          // "far too short to be one" is trivially checkable here rather than
+          // hours later when the user finds out it does not work.
+          val wantsSecret = listOf("key", "token", "password", "secret", "code", "api")
+            .any { currentRequest.lowercase().contains(it) }
+          if (wantsSecret && clip.trim().length < 16) {
+            res.put("ok", false)
+              .put(
+                "almost_certainly_wrong",
+                "This is ${clip.trim().length} characters. An API key, token or password is far longer than that — " +
+                  "a Google AI Studio key is around 39. You have copied a fragment, a label, or the wrong element " +
+                  "entirely. Do NOT give this to the user and do NOT paste it anywhere."
+              )
+              .put(
+                "do_now",
+                "Look at the screen, find the FULL value, and copy it properly — usually the copy button beside it " +
+                  "rather than the text. Then read the clipboard again and check the length looks right."
+              )
+          }
+          res
         }
       }
       "swipe" -> {
