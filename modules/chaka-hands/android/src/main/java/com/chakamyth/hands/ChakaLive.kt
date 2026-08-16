@@ -509,7 +509,8 @@ class ChakaLive(
       "- THE LIST SAYS WHAT IS THERE. THE PICTURE SAYS WHAT STATE IT IS IN. Those are different questions and you must not answer the second from the first. On most Settings screens the switch is a separate unlabelled node, so a row arrives as plain text with no ON or OFF attached — that means UNKNOWN, never OFF. 'Is wireless debugging on?', 'is it enabled?', 'is it checked?', 'did it turn on?' are all questions only your eyes can answer: find the row in the picture, look at the switch beside it, and read it. If it is not on screen yet, scroll until it IS and then look. Never answer a state question from the element list, and never scroll past the very row you were asked about because the list did not label it.\n" +
       "- IF TAPS DO NOTHING, THE SCREEN IS PROBABLY STILL LOADING. Several actions in a row reporting no change usually means the page has not finished drawing - not that you are aiming badly. Call wait (with more seconds) before trying anything else. Tapping a half-drawn screen achieves nothing and shifts the element numbers underneath you.\n" +
       "- A BLANK OR HALF-DRAWN SCREEN MEANS LOADING, NOT FAILURE. Sign-in pages, browsers and anything on a slow connection take a moment. Call wait and look again. NEVER press back on a screen that is still loading - the tap that got you there worked, and going back throws it away and starts you round the loop again.\n" +
-      "- CHECKBOXES, RADIO BUTTONS AND SWITCHES: tap the LABEL TEXT beside the control, not the little box. The box itself is often a few pixels and not the clickable node; the row or its text usually is. If tapping the box does nothing, tap the words next to it. An element with a blank label is rarely the right target — prefer the one with readable text.\n" +
+      "- CHECKBOXES AND RADIO BUTTONS IN A FORM OR DIALOG: tap the LABEL TEXT beside the control, not the little box. The box itself is often a few pixels and not the clickable node; the row or its text usually is. If tapping the box does nothing, tap the words next to it.\n" +
+      "  BUT NOT ON A SETTINGS LIST. There, the label is a link to that setting's own page and the switch is the thing that toggles — tapping the words is how you end up somewhere you were never asked to go. On a Settings row, aim at the switch.\n" +
       "- IF A TAP CHANGES NOTHING TWICE, THE TARGET IS WRONG, NOT THE AIM. Do not nudge the coordinates by a hair and retry. Read the screen again, pick a DIFFERENT element (the label, the row, the parent), or scroll in case the real control is elsewhere.\n" +
       "- AFTER MOVING AN ICON, LOOK - NEVER PRESS BACK. Back cancels the move and puts it straight back where it was. If the home screen is in edit mode afterwards, tap an empty part of the screen to settle it.\n" +
       "- MOVING AN ICON MEANS PICKING IT UP FIRST: drag with hold:true, from the icon to where it should go. A normal drag does not lift it, so nothing moves however many times you try. If a move does not work, check you are dragging the RIGHT icon - the one named in the request - and that you used hold.\n" +
@@ -529,8 +530,11 @@ class ChakaLive(
       "- Typing is not sending. After typing you MUST tap the send button (or press_enter) and then confirm it actually sent.\n" +
       "- If a reply appears on screen, read it out straight away and continue — don't wait to be asked what it said.\n" +
       "- Only stop when the goal is done, they tell you to stop, or you're genuinely blocked. Only ask when it's truly ambiguous and you cannot reasonably choose (e.g. which of two accounts is theirs).\n" +
-      "\nTAPPING — you have two ways, use both:\n" +
-      "- read_screen + tap_index is most precise; prefer it when the target is listed.\n" +
+      "\nTAPPING — THE NUMBERS ARE DRAWN ON THE SCREEN. LOOK AT THEM AND USE THEM:\n" +
+      "- Every tappable thing has a RED NUMBERED BOX drawn over it in the picture you are being shown. That number IS the index for tap_index. So do not estimate where something is — READ ITS NUMBER OFF THE PICTURE and tap_index that number. This is the difference between hitting the control and hitting the gap beside it.\n" +
+      "- CHECK THE BOX ACTUALLY SITS ON WHAT YOU WANT before you tap it. The number in read_screen's text list and the number drawn on the picture are the same number, so you can confirm the label and the position agree. If they disagree, believe the picture.\n" +
+      "- A SETTINGS ROW AND ITS SWITCH ARE TWO DIFFERENT BOXES WITH TWO DIFFERENT NUMBERS. Tapping the ROW opens that setting's own page. Tapping the SWITCH turns it on or off. If you were asked to TURN SOMETHING ON, you want the switch's box — the small one at the right-hand end of the row — not the row. Tapping the row instead leaves you on a screen nobody asked for, and then you are recovering from your own mistake instead of doing the task.\n" +
+      "- read_screen + tap_index is how you aim. tap_at, guessing at coordinates, is the last resort and it misses: measured against a real screen it lands up to half a row away, sometimes in the gap between two controls where the tap does nothing at all.\n" +
       "- MANY things are NOT in the element list: buttons inside web pages, photos in a gallery grid, canvas/custom UI. If you can SEE it in the frame but read_screen doesn't list it, use tap_at with fractional coordinates (x and y from 0 to 1, measured from the top-left of the screen). NEVER give up and ask them to tap it themselves — estimate the position from the frame and tap_at it. If your first tap misses, adjust the coordinates and try again.\n" +
       "- long_press_at works the same way for press-and-hold.\n" +
       "\nOTHER:\n" +
@@ -910,8 +914,9 @@ class ChakaLive(
           Thread {
             Thread.sleep(450)  // let the screen settle
             if (!cancelled && ready) {
-              val nowSig = runCatching { sig(JSONObject(service.dumpScreen())) }.getOrDefault("")
-              captureBlocking()?.let { shot ->
+              val freshDump = runCatching { JSONObject(service.dumpScreen()) }.getOrNull()
+              val nowSig = freshDump?.let { sig(it) } ?: ""
+              captureBlocking(marks = freshDump?.optJSONArray("els"))?.let { shot ->
                 val prompt = when {
                   awaitingDoneProof ->
                     "This is the REAL current screen. Check every part of what the user asked is visibly complete here. " +
@@ -1303,7 +1308,7 @@ class ChakaLive(
           // buried in inputs stops producing turns.
           if (!moved && !stale) continue
 
-          sendFrame(ws, forSig = nowSig)
+          sendFrame(ws, forSig = nowSig, marks = dump.optJSONArray("els"))
         } catch (e: InterruptedException) {
           return@Thread
         } catch (e: Exception) {
@@ -1388,7 +1393,8 @@ class ChakaLive(
     ws: WebSocket,
     force: Boolean = false,
     forSig: String = "",
-    timeoutMs: Long = 4000
+    timeoutMs: Long = 4000,
+    marks: JSONArray? = null
   ): Boolean {
     val now = System.currentTimeMillis()
     synchronized(frameLock) {
@@ -1398,10 +1404,17 @@ class ChakaLive(
       if (!force && now - lastFrameAt < MIN_FRAME_GAP_MS) return false
       lastFrameAt = now
     }
-    val shot = captureBlocking(timeoutMs) ?: return false
-    val sig = forSig.ifBlank {
-      runCatching { sig(JSONObject(service.dumpScreen())) }.getOrDefault("")
+    // Callers that have just dumped the tree hand it over; anyone else pays for
+    // one more walk, because a frame without numbers on it is a frame she has
+    // to aim at by eye.
+    var sig = forSig
+    var els = marks
+    if (els == null || sig.isEmpty()) {
+      val dump = runCatching { JSONObject(service.dumpScreen()) }.getOrNull()
+      if (els == null) els = dump?.optJSONArray("els")
+      if (sig.isEmpty()) sig = dump?.let { sig(it) } ?: ""
     }
+    val shot = captureBlocking(timeoutMs, els) ?: return false
     return emitFrame(ws, shot, sig)
   }
 
@@ -1423,7 +1436,7 @@ class ChakaLive(
     val now = System.currentTimeMillis()
     if (want.isNotEmpty() && want == lastFrameSig && now - lastFrameAt < FRAME_FRESH_MS) return true
     Log.i(TAG, "look-before-act: screen not yet shown to her, sending a frame first")
-    return sendFrame(ws, force = true, forSig = want, timeoutMs = 1600)
+    return sendFrame(ws, force = true, forSig = want, timeoutMs = 1600, marks = dump.optJSONArray("els"))
   }
 
   /**
@@ -1432,13 +1445,18 @@ class ChakaLive(
    * capture there is a stutter in her speech, so the paths around an action
    * give up quickly and say they saw nothing rather than hold the audio up.
    */
-  private fun captureBlocking(timeoutMs: Long = 4000): String? {
+  private fun captureBlocking(timeoutMs: Long = 4000, marks: JSONArray? = null): String? {
     var result: String? = null
     val lock = Object()
     var done = false
     // Small + cheap: she needs to recognise the screen, not read fine print, and
     // read_screen gives her exact labels anyway.
-    service.captureScreenshot(null, LIVE_FRAME_WIDTH, LIVE_FRAME_QUALITY) { b64 ->
+    //
+    // [marks] draws each tappable element's index onto the frame — Set-of-Marks.
+    // It has been in the service since v2.1.5 and ChakaOperator has always used
+    // it; Live Mode passed null and never once had the numbers, which is why she
+    // aims by eye here and misses.
+    service.captureScreenshot(marks, LIVE_FRAME_WIDTH, LIVE_FRAME_QUALITY) { b64 ->
       synchronized(lock) { result = b64; done = true; lock.notifyAll() }
     }
     synchronized(lock) {
@@ -1732,7 +1750,9 @@ class ChakaLive(
     // changed" she is already looking at what it changed into. The capture
     // takes roughly the 200ms that used to be dead sleep here, so verification
     // costs no more than the wait it replaced.
-    val sawResult = socket?.let { sendFrame(it, force = true, forSig = sig(after), timeoutMs = 1600) } ?: false
+    val sawResult = socket?.let {
+      sendFrame(it, force = true, forSig = sig(after), timeoutMs = 1600, marks = after.optJSONArray("els"))
+    } ?: false
 
     consecutiveBlocks = 0
 
