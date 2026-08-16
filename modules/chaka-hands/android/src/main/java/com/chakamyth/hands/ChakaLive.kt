@@ -202,9 +202,12 @@ class ChakaLive(
     // seconds and choked the session.
     private const val MIN_DRIVE_GAP_MS = 12000L
     private const val OUT_RATE = 24000   // model's audio output rate
-    private val STOP_WORDS = listOf(
-      "stop", "wait", "don't", "dont", "cancel", "abort", "hold on", "no no", "quit"
-    )
+    // A halt: unambiguous, and fine as an opener.
+    private val STOP_WORDS = listOf("stop", "wait", "cancel", "abort", "hold on", "quit")
+    // A prohibition. "Don't create a new one, copy the one from before" is an
+    // INSTRUCTION, not a request to freeze - it only means stop when it stands
+    // more or less alone.
+    private val SOFT_STOP = listOf("don't", "dont", "no no", "do not")
   }
 
   /**
@@ -729,7 +732,9 @@ class ChakaLive(
           // "don't uninstall it, just remove it from the home screen" froze her
           // completely and she refused to act on a normal request.
           val isStop = STOP_WORDS.any { w -> said.startsWith(w) } ||
-            (words <= 6 && STOP_WORDS.any { w -> said.contains(w) })
+            (words <= 6 && STOP_WORDS.any { w -> said.contains(w) }) ||
+            // "Don't." on its own halts; "Don't do X, do Y" is a redirect.
+            (words <= 4 && SOFT_STOP.any { w -> said.startsWith(w) })
           if (isStop) {
             // Stop is enforced here, not left to the model — it ignored spoken
             // stops and kept going with things the user didn't want.
