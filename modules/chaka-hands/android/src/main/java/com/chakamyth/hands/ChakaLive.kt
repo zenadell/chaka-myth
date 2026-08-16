@@ -157,6 +157,13 @@ class ChakaLive(
   // How many actions in a row produced no real change. If nothing has moved,
   // the task cannot be finished, whatever she believes.
   @Volatile private var lastHoldDragAt = 0L
+  // A hunt: consecutive swipes all looking for the same thing. The loop guard
+  // cannot see this, because every swipe genuinely changes the screen, so each
+  // (screen, action) pair is new and nothing ever repeats. Meanwhile she can
+  // scroll past the target over and over — 28 times, measured, with the row in
+  // the middle of the screen the whole while.
+  @Volatile private var huntFor = ""
+  @Volatile private var huntSwipes = 0
   @Volatile private var noProgressRun = 0
   @Volatile private var pendingExpect = ""
   @Volatile private var lastVerified = false
@@ -1544,14 +1551,38 @@ class ChakaLive(
 
     val want = expect.lowercase()
       .split(Regex("[^a-z0-9]+"))
-      .filter { it.length > 3 && it !in setOf("the","this","that","with","option","appear","appears","screen","show","shows","button","setting","settings","find","view") }
+      .filter {
+        it.length > 3 && it !in setOf(
+          "the","this","that","with","option","appear","appears","screen","show","shows",
+          "button","setting","settings","find","view",
+          // Filler from the way she phrases an expectation. Leaving these in is
+          // what broke this guard: "the 'Wireless debugging' setting comes into
+          // view" reduced to [wireless, debugging, comes, into], every one of
+          // which had to appear in a single label. No label contains "comes".
+          // So the one guard written to stop her scrolling past Wireless
+          // debugging never fired, not once, and she swiped 28 times with the
+          // row sitting in the middle of the screen.
+          "comes","come","into","onto","back","then","next","will","would","should",
+          "becomes","become","visible","again","list","page","down","above","below",
+          "where","which","there","here","been","have","gets","appearing"
+        )
+      }
     if (want.isEmpty()) return null
 
-    // A visible label containing every meaningful word she's looking for.
-    val hit = labels.firstOrNull { (_, label) ->
-      val l = label.lowercase()
-      want.all { l.contains(it) }
-    } ?: return null
+    // Score, don't demand-all. The label that shares the most words with what
+    // she is looking for wins, and two matching words is enough to say "it is
+    // right there" — as is one, if it is distinctive enough to be a real name.
+    val scored = labels
+      .map { (i, label) ->
+        val l = label.lowercase()
+        Triple(i, label, want.count { l.contains(it) })
+      }
+      .maxByOrNull { it.third }
+      ?: return null
+    val matched = want.filter { scored.second.lowercase().contains(it) }
+    val strong = scored.third >= 2 || (scored.third == 1 && matched.any { it.length >= 8 })
+    if (!strong) return null
+    val hit = scored.first to scored.second
 
     Log.i(TAG, "refusing scroll — \"${hit.second}\" is already on screen at [${hit.first}]")
     return JSONObject()
@@ -1955,6 +1986,9 @@ class ChakaLive(
     // the blind tap we are trying to make impossible.
     if (name in TOUCHES_THE_PHONE) ensureSeen(dump)
 
+    // Any action that is not another swipe means she stopped hunting.
+    if (name != "swipe") { huntFor = ""; huntSwipes = 0 }
+
     return when (name) {
       "read_screen" -> {
         lastScreenReadAt = System.currentTimeMillis()
@@ -2256,6 +2290,34 @@ class ChakaLive(
         // and down six times hunting for "Wireless debugging" while it sat in
         // the element list in front of her.
         alreadyOnScreen(dump, args.optString("expect"))?.let { return it }
+
+        // Backstop for when the text match misses anyway — the label may be
+        // worded differently from what she is expecting, or split across two
+        // nodes. Whatever the reason, scrolling for the same thing over and
+        // over is not searching, it is thrashing, and the answer is to look.
+        val goal = args.optString("expect").lowercase().trim()
+        if (goal.isNotEmpty() && goal == huntFor) huntSwipes++ else { huntFor = goal; huntSwipes = 1 }
+        if (huntSwipes >= 4) {
+          Log.w(TAG, "HUNT BLOCKED: $huntSwipes swipes all expecting \"$goal\"")
+          huntSwipes = 0
+          pendingLook = true
+          return JSONObject()
+            .put("ok", false)
+            .put("stop_scrolling", true)
+            .put("swipes_wasted", 4)
+            .put(
+              "error",
+              "You have now swiped four times in a row looking for the same thing and you have not found it. " +
+                "Scrolling is not working. It is very likely already on screen and you are going past it."
+            )
+            .put(
+              "do_now",
+              "STOP scrolling. A picture follows. Look at it properly, read the rows one by one, and SAY OUT LOUD " +
+                "what you can see. If what you want is there, tap its numbered box. If it genuinely is not there, " +
+                "say so and say which direction you have already tried, instead of swiping again."
+            )
+            .put("screen_now", screenBrief(dump))
+        }
         // Horizontal swipes have to be a proper FLING or the page springs back.
         // The old 32%-of-width drag over 300ms was too short and too slow to
         // commit a launcher page — it moved halfway and snapped home, which read
