@@ -164,6 +164,13 @@ class ChakaLive(
   // the middle of the screen the whole while.
   @Volatile private var huntFor = ""
   @Volatile private var huntSwipes = 0
+  // Direction, and how often she has changed her mind about it. Raw swipe count
+  // is the wrong thing to punish: Developer options is long, and reaching
+  // Wireless debugging honestly takes eight or ten swipes in one direction.
+  // Blocking at four wedged her against a list she simply had not finished
+  // scrolling. Turning round and round is the failure — down, up, down, up.
+  @Volatile private var huntDir = ""
+  @Volatile private var huntReversals = 0
   @Volatile private var noProgressRun = 0
   @Volatile private var pendingExpect = ""
   @Volatile private var lastVerified = false
@@ -1579,9 +1586,17 @@ class ChakaLive(
       }
       .maxByOrNull { it.third }
       ?: return null
-    val matched = want.filter { scored.second.lowercase().contains(it) }
-    val strong = scored.third >= 2 || (scored.third == 1 && matched.any { it.length >= 8 })
-    if (!strong) return null
+    // EVERY content word has to be there. Matching on one long word looked
+    // generous and was wrong: hunting "Wireless debugging" it latched onto the
+    // section HEADER "Debugging" and told her the row was already on screen
+    // when the row was still well below the fold. She ignored it — correctly —
+    // and then the hunt guard blocked the scrolling she actually needed, which
+    // wedged her between two of my own guards.
+    //
+    // The original rule was right; only the filler words were wrong. So: all of
+    // [wireless, debugging] must appear in one label. "Debugging" alone is one
+    // out of two, and does not fire.
+    if (scored.third < want.size) return null
     val hit = scored.first to scored.second
 
     Log.i(TAG, "refusing scroll — \"${hit.second}\" is already on screen at [${hit.first}]")
@@ -2000,7 +2015,9 @@ class ChakaLive(
     // fired every time, was reset every time, and the halt at 8 was unreachable.
     // A guard whose own advice — "stop and look at the screen" — disarms it is
     // not a guard.
-    if (name in TOUCHES_THE_PHONE && name != "swipe") { huntFor = ""; huntSwipes = 0 }
+    if (name in TOUCHES_THE_PHONE && name != "swipe") {
+      huntFor = ""; huntSwipes = 0; huntReversals = 0; huntDir = ""
+    }
 
     return when (name) {
       "read_screen" -> {
@@ -2304,14 +2321,25 @@ class ChakaLive(
         // a row, all identical, and the backstop never once fired because the
         // refusal returned before reaching it.
         val goal = args.optString("expect").lowercase().trim()
-        if (goal.isNotEmpty() && goal == huntFor) huntSwipes++ else { huntFor = goal; huntSwipes = 1 }
+        if (goal.isNotEmpty() && goal == huntFor) {
+          huntSwipes++
+          // Changing her mind about which way to go is the tell.
+          if (huntDir.isNotEmpty() && dir != huntDir) huntReversals++
+        } else {
+          huntFor = goal; huntSwipes = 1; huntReversals = 0
+        }
+        huntDir = dir
 
-        // She will not stop on her own. She has hammered a blocked action
-        // eleven times before, and thirty times here, so refusing has to cost
-        // her something more each time it is ignored.
-        if (huntSwipes >= 8) {
-          Log.w(TAG, "HUNT HALTED after $huntSwipes swipes for \"$goal\"")
-          huntFor = ""; huntSwipes = 0
+        // Count TURNS, not swipes. Blocking at four raw swipes was wrong and it
+        // wedged her: Developer options is long, and reaching Wireless
+        // debugging honestly takes eight or ten swipes in a row downwards. She
+        // was doing the right thing and being refused for it. Going down, then
+        // up, then down again is what "lost" actually looks like.
+        // She will not stop on her own — eleven identical blocked taps in
+        // ccbbd4d, thirty refused swipes here — so this still has to escalate.
+        if (huntReversals >= 4 || huntSwipes >= 18) {
+          Log.w(TAG, "HUNT HALTED after $huntSwipes swipes / $huntReversals turns for \"$goal\"")
+          huntFor = ""; huntSwipes = 0; huntReversals = 0; huntDir = ""
           taskActive = false
           pendingLook = true
           return JSONObject()
@@ -2329,8 +2357,8 @@ class ChakaLive(
             )
             .put("screen_now", screenBrief(dump))
         }
-        if (huntSwipes >= 4) {
-          Log.w(TAG, "HUNT BLOCKED: $huntSwipes swipes all expecting \"$goal\"")
+        if (huntReversals >= 2 || huntSwipes >= 12) {
+          Log.w(TAG, "HUNT BLOCKED: $huntSwipes swipes / $huntReversals turns expecting \"$goal\"")
           pendingLook = true
           return JSONObject()
             .put("ok", false)
