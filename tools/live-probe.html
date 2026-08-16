@@ -1,0 +1,323 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Chaka Live probe — can she see, and does she remember?</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin:0; background:#0d0d0f; color:#e8e6e3; font:14px/1.5 ui-sans-serif,system-ui,-apple-system,sans-serif; }
+  header { padding:16px 20px; border-bottom:1px solid #26262b; }
+  h1 { margin:0 0 4px; font-size:16px; letter-spacing:.02em; }
+  header p { margin:0; color:#8b8b93; font-size:13px; }
+  main { display:grid; grid-template-columns:minmax(260px,320px) 1fr; gap:20px; padding:20px; align-items:start; }
+  @media (max-width:820px){ main{ grid-template-columns:1fr; } }
+  .panel { background:#141417; border:1px solid #26262b; border-radius:10px; padding:14px; }
+  .panel h2 { margin:0 0 10px; font-size:12px; text-transform:uppercase; letter-spacing:.08em; color:#8b8b93; }
+  label { display:block; margin:10px 0 4px; font-size:12px; color:#a9a9b2; }
+  input[type=password], input[type=number], select {
+    width:100%; box-sizing:border-box; background:#0d0d0f; color:#e8e6e3;
+    border:1px solid #32323a; border-radius:6px; padding:8px 10px; font:inherit;
+  }
+  button { margin-top:14px; width:100%; background:#e5602a; color:#fff; border:0;
+    border-radius:6px; padding:10px; font:600 14px/1 inherit; cursor:pointer; }
+  button:disabled { background:#3a3a42; color:#7d7d86; cursor:not-allowed; }
+  canvas { width:100%; max-width:220px; border-radius:8px; border:1px solid #32323a; display:block; margin:0 auto; }
+  #log { font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace; white-space:pre-wrap;
+    word-break:break-word; max-height:56vh; overflow:auto; background:#0d0d0f;
+    border:1px solid #26262b; border-radius:8px; padding:12px; }
+  .t-sent{color:#6ea8fe}.t-recv{color:#8b8b93}.t-say{color:#9be29b}.t-err{color:#ff8080}.t-info{color:#e8c07a}
+  .verdict { margin-top:12px; padding:12px; border-radius:8px; font-weight:600; }
+  .pass { background:#12301a; border:1px solid #2c6b3c; color:#9be29b; }
+  .fail { background:#331416; border:1px solid #6b2c30; color:#ff9c9c; }
+  .truth { margin-top:10px; padding:8px 10px; background:#0d0d0f; border:1px solid #32323a;
+    border-radius:6px; font:12px ui-monospace,monospace; color:#a9a9b2; }
+  .row { display:flex; gap:10px; } .row > * { flex:1; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Chaka Live probe</h1>
+  <p>Streams a synthetic Android screen to the real Live API, scrolls the setting out of view, then asks about it. Tests whether she sees it — and whether she still remembers.</p>
+</header>
+
+<main>
+  <div class="panel">
+    <h2>Setup</h2>
+
+    <label for="key">Gemini API key <span style="color:#8b8b93">(stays in this page)</span></label>
+    <input id="key" type="password" placeholder="AIza…" autocomplete="off">
+
+    <label for="preset">Context window compression</label>
+    <select id="preset">
+      <option value="new">NEW — trigger 96000 / target 32000</option>
+      <option value="old">OLD — trigger 16000 / target 8000 (the bug)</option>
+    </select>
+
+    <div class="row">
+      <div>
+        <label for="showFor">Show setting (s)</label>
+        <input id="showFor" type="number" value="12" min="3" max="120">
+      </div>
+      <div>
+        <label for="thenFor">Then scrolled away (s)</label>
+        <input id="thenFor" type="number" value="45" min="0" max="600">
+      </div>
+    </div>
+
+    <label for="state">Wireless debugging is actually…</label>
+    <select id="state">
+      <option value="random">Random (don't tell me)</option>
+      <option value="on">ON</option>
+      <option value="off">OFF</option>
+    </select>
+
+    <button id="run">Run probe</button>
+    <button id="stop" disabled style="background:#3a3a42">Stop</button>
+
+    <div class="truth" id="truth">Ground truth: —</div>
+    <canvas id="screen" width="720" height="1600"></canvas>
+  </div>
+
+  <div class="panel">
+    <h2>Protocol log</h2>
+    <div id="log"></div>
+    <div id="verdict"></div>
+  </div>
+</main>
+
+<script src="./live-probe-prompt.js"></script>
+<script>
+const MODEL = "gemini-3.1-flash-live-preview";
+const WS = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent";
+// Mirrors ChakaLive.kt: LIVE_FRAME_WIDTH / LIVE_FRAME_QUALITY / MIN_FRAME_GAP_MS.
+const FRAME_QUALITY = 0.55, FRAME_MS = 1100;
+
+const $ = id => document.getElementById(id);
+const logEl = $("log");
+let ws = null, frameTimer = null, running = false, truth = null, said = "", framesSent = 0;
+
+function log(cls, msg) {
+  const line = document.createElement("div");
+  line.className = "t-" + cls;
+  line.textContent = new Date().toLocaleTimeString() + "  " + msg;
+  logEl.appendChild(line);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+/* ---------- the fake phone screen ---------- */
+// Two views of one Developer options list. Scrolling from the first to the
+// second is the exact move that lost her the answer on the real phone.
+const ROWS_TOP = [
+  ["Memory", null], ["Bug report", null], ["Desktop backup password", null],
+  ["Stay awake", false], ["Enable Bluetooth HCI snoop log", false],
+  ["OEM unlocking", false], ["Running services", null],
+  ["USB debugging", true], ["Wireless debugging", "TARGET"],
+  ["Revoke USB debugging authorisations", null],
+];
+const ROWS_SCROLLED = [
+  ["Verify apps over USB", true], ["Wireless display certification", false],
+  ["Enable Wi-Fi verbose logging", false], ["Mobile data always active", true],
+  ["Tethering hardware acceleration", true], ["Bluetooth AVRCP version", null],
+  ["Bluetooth MAP version", null], ["Select USB Configuration", null],
+  ["Disable absolute volume", false], ["Enable Gabeldorsche", false],
+];
+
+function drawScreen(rows) {
+  const c = $("screen"), g = c.getContext("2d");
+  g.fillStyle = "#101014"; g.fillRect(0, 0, 720, 1600);
+  // status bar
+  g.fillStyle = "#e8e6e3"; g.font = "600 26px sans-serif";
+  g.fillText("1:42", 28, 46);
+  g.textAlign = "right"; g.fillText("81%", 692, 46); g.textAlign = "left";
+  // title
+  g.font = "600 44px sans-serif"; g.fillText("Developer options", 32, 150);
+
+  let y = 240;
+  for (const [label, sw] of rows) {
+    const isTarget = sw === "TARGET";
+    const on = isTarget ? truth === "on" : sw;
+    g.fillStyle = "#e8e6e3"; g.font = "34px sans-serif";
+    g.fillText(label, 32, y + 10);
+    if (sw !== null) {
+      const x = 600, cy = y - 2;
+      g.fillStyle = on ? "#7bc67b" : "#4a4a52";
+      g.beginPath(); g.roundRect(x, cy - 20, 84, 44, 22); g.fill();
+      g.fillStyle = "#f4f4f6";
+      g.beginPath(); g.arc(on ? x + 60 : x + 24, cy + 2, 17, 0, Math.PI * 2); g.fill();
+    }
+    g.strokeStyle = "#1e1e24"; g.beginPath();
+    g.moveTo(32, y + 46); g.lineTo(688, y + 46); g.stroke();
+    y += 118;
+  }
+  return c;
+}
+
+const frameB64 = () =>
+  $("screen").toDataURL("image/jpeg", FRAME_QUALITY).split(",")[1];
+
+/* ---------- the Live session ---------- */
+function setupMessage(preset) {
+  const compression = preset === "old"
+    ? { triggerTokens: "16000", slidingWindow: { targetTokens: "8000" } }
+    : { triggerTokens: "96000", slidingWindow: { targetTokens: "32000" } };
+
+  return { setup: {
+    model: "models/" + MODEL,
+    systemInstruction: { parts: [{ text: window.CHAKA_SYS }] },
+    tools: [{ functionDeclarations: TOOLS }],
+    contextWindowCompression: compression,
+    mediaResolution: "MEDIA_RESOLUTION_LOW",
+    outputAudioTranscription: {},
+    inputAudioTranscription: {},
+    generationConfig: {
+      temperature: 0.3,
+      responseModalities: ["AUDIO"],
+      speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: "Kore" } } },
+    },
+  }};
+}
+
+// The token weight of the declarations is part of what crowds the window, so
+// the main ones are here rather than a token stub.
+const P = (props, req) => ({ type: "object", properties: props, required: req || [] });
+const S = d => ({ type: "string", description: d });
+const N = d => ({ type: "number", description: d });
+const TOOLS = [
+  { name: "read_screen", description: "Read the current screen: every element with its index, label, and whether it's tappable/editable/toggled. Call this before tapping.", parameters: P({}) },
+  { name: "tap_index", description: "Tap the element with this index (from read_screen).", parameters: P({ index: { type: "integer", description: "Element index" }, expect: S("REQUIRED. What you expect to see after this tap.") }, ["index", "expect"]) },
+  { name: "type_text", description: "Type into the focused field. Tap the field first.", parameters: P({ text: S("Text to type"), expect: S("REQUIRED. What the screen should show afterwards.") }, ["text", "expect"]) },
+  { name: "press_enter", description: "Press the keyboard enter/search key.", parameters: P({}) },
+  { name: "read_clipboard", description: "Read what is currently on the clipboard. ALWAYS call this after tapping a Copy button and before pasting.", parameters: P({}) },
+  { name: "swipe", description: "Scroll the screen. direction: down (reveal content further down), up, left, right. amount: tiny|normal|long.", parameters: P({ direction: S("down|up|left|right"), amount: S("tiny|normal|long"), expect: S("REQUIRED. What should come into view.") }, ["direction", "expect"]) },
+  { name: "press_button", description: "Press a system button: back, home, recents, notifications, quick_settings.", parameters: P({ button: S("back|home|recents|notifications|quick_settings") }, ["button"]) },
+  { name: "open_app", description: "Launch an app by name.", parameters: P({ app: S("App name") }, ["app"]) },
+  { name: "navigate", description: "Open a website URL in the browser.", parameters: P({ url: S("Full URL") }, ["url"]) },
+  { name: "tap_at", description: "Tap anywhere by fractional position (x,y each 0..1 from the top-left). USE THIS for anything you can see in the frame but read_screen does not list.", parameters: P({ x: N("0..1 across"), y: N("0..1 down"), expect: S("REQUIRED.") }, ["x", "y", "expect"]) },
+  { name: "long_press_at", description: "Press and hold at a fractional position (x,y each 0..1).", parameters: P({ x: N("0..1 across"), y: N("0..1 down") }, ["x", "y"]) },
+  { name: "look_at_screen", description: "Stop and study the screen properly. You are already being streamed a picture continuously, so use this only when you need a deliberate close look.", parameters: P({}) },
+  { name: "open_app_drawer", description: "Open the app drawer (the full list of installed apps).", parameters: P({}) },
+  { name: "drag", description: "Drag from one point to another, both as fractions 0..1. For picker wheels, sliders, carousels, reordering.", parameters: P({ from_x: N("0..1"), from_y: N("0..1"), to_x: N("0..1"), to_y: N("0..1"), slow: { type: "boolean", description: "precise drag" }, hold: { type: "boolean", description: "press and hold first" }, expect: S("REQUIRED.") }, ["from_x", "from_y", "to_x", "to_y", "expect"]) },
+  { name: "answer_call", description: "Answer the incoming phone call.", parameters: P({}) },
+  { name: "end_call", description: "End or reject the current phone call.", parameters: P({}) },
+  { name: "task_done", description: "Call this ONLY when the current task is fully finished and the screen proves it.", parameters: P({ summary: S("What was accomplished") }, ["summary"]) },
+];
+
+const send = obj => { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); };
+const sendFrame = () => {
+  send({ realtimeInput: { video: { mimeType: "image/jpeg", data: frameB64() } } });
+  framesSent++;
+  if (framesSent % 10 === 1) log("sent", `vision: ${framesSent} frames streamed`);
+};
+const sendText = t => { log("sent", `text -> "${t}"`); send({ realtimeInput: { text: t } }); };
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+async function run() {
+  const key = $("key").value.trim();
+  if (!key) { log("err", "Paste a Gemini API key first."); return; }
+
+  running = true; framesSent = 0; said = "";
+  $("run").disabled = true; $("stop").disabled = false;
+  $("verdict").innerHTML = ""; logEl.innerHTML = "";
+
+  const want = $("state").value;
+  truth = want === "random" ? (Math.random() < 0.5 ? "on" : "off") : want;
+  $("truth").textContent = "Ground truth: Wireless debugging is " + truth.toUpperCase();
+  drawScreen(ROWS_TOP);
+
+  const preset = $("preset").value;
+  log("info", `connecting — model=${MODEL}, compression=${preset.toUpperCase()}`);
+  log("info", `system instruction: ${window.CHAKA_SYS.length} chars (~${Math.round(window.CHAKA_SYS.length / 4)} tokens)`);
+
+  ws = new WebSocket(`${WS}?key=${encodeURIComponent(key)}`);
+
+  ws.onopen = () => { log("info", "socket open — sending setup"); send(setupMessage(preset)); };
+
+  ws.onclose = e => {
+    log(e.code === 1000 ? "info" : "err", `socket closed ${e.code} ${e.reason || ""}`);
+    if (e.code === 1007 || e.code === 1008) log("err", "REJECTED — the setup or a message shape is invalid.");
+    teardown();
+  };
+  ws.onerror = () => log("err", "socket error");
+
+  ws.onmessage = async ev => {
+    const raw = ev.data instanceof Blob ? await ev.data.text() : ev.data;
+    let m; try { m = JSON.parse(raw); } catch { return; }
+
+    if (m.error) { log("err", "server error: " + JSON.stringify(m.error).slice(0, 300)); return; }
+
+    if (m.setupComplete) {
+      log("info", "setupComplete — streaming frames");
+      frameTimer = setInterval(() => { if (running) sendFrame(); }, FRAME_MS);
+      sendFrame();
+      probe();
+      return;
+    }
+    if (m.goAway) { log("err", "goAway: " + JSON.stringify(m.goAway)); return; }
+    if (m.toolCall) {
+      const names = (m.toolCall.functionCalls || []).map(c => c.name).join(", ");
+      log("recv", "toolCall: " + names);
+      // Answer everything with a neutral result so she keeps talking.
+      send({ toolResponse: { functionResponses: (m.toolCall.functionCalls || []).map(c => ({
+        id: c.id, name: c.name, response: { ok: true, note: "This is a probe — no real device. Answer the question from what you have SEEN." },
+      })) } });
+      return;
+    }
+    const sc = m.serverContent;
+    if (!sc) return;
+    const t = sc.outputTranscription && sc.outputTranscription.text;
+    if (t) said += t;
+    if (sc.turnComplete) {
+      const s = said.trim(); said = "";
+      if (s) log("say", "SHE SAID: " + s);
+      if (s && window.__awaitingAnswer) { window.__awaitingAnswer = false; judge(s); }
+    }
+  };
+}
+
+async function probe() {
+  const showFor = +$("showFor").value, thenFor = +$("thenFor").value;
+
+  log("info", `PHASE 1 — Wireless debugging (${truth.toUpperCase()}) visible for ${showFor}s`);
+  await sleep(showFor * 1000);
+  if (!running) return;
+
+  log("info", `PHASE 2 — scrolled away for ${thenFor}s; the row is no longer on screen`);
+  drawScreen(ROWS_SCROLLED);
+  await sleep(thenFor * 1000);
+  if (!running) return;
+
+  log("info", `PHASE 3 — asking. ${framesSent} frames streamed so far.`);
+  window.__awaitingAnswer = true;
+  sendText(
+    "Answer from what you have already SEEN on this screen — do not call any tools, do not scroll. " +
+    "Was the Wireless debugging switch ON or OFF? Reply with exactly one word: ON, OFF, or UNKNOWN."
+  );
+}
+
+function judge(s) {
+  const u = s.toUpperCase();
+  const saidOn = /\bON\b/.test(u), saidOff = /\bOFF\b/.test(u);
+  const answer = saidOff ? "off" : saidOn ? "on" : "unknown";
+  const ok = answer === truth;
+  const v = $("verdict");
+  v.className = "verdict " + (ok ? "pass" : "fail");
+  v.textContent = ok
+    ? `PASS — she said ${answer.toUpperCase()}, and it was ${truth.toUpperCase()}. She saw it and still had it ${$("thenFor").value}s later.`
+    : `FAIL — she said "${answer.toUpperCase()}", but it was ${truth.toUpperCase()}. (${framesSent} frames streamed.)`;
+  log("info", "verdict: " + (ok ? "PASS" : "FAIL"));
+}
+
+function teardown() {
+  running = false;
+  clearInterval(frameTimer); frameTimer = null;
+  $("run").disabled = false; $("stop").disabled = true;
+}
+
+$("run").onclick = run;
+$("stop").onclick = () => { log("info", "stopped"); if (ws) ws.close(1000, "done"); teardown(); };
+drawScreen(ROWS_TOP);
+</script>
+</body>
+</html>
