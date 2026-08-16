@@ -2285,39 +2285,64 @@ class ChakaLive(
         val bottom = (h * 0.78).toInt()
         val dy = (h * frac).toInt()
         val dir = args.optString("direction", "down")
+        // COUNT THE HUNT FIRST. This used to sit below the two guards, which
+        // meant a refused swipe never counted — and a refusal she ignores is
+        // precisely what needs catching. Measured on the phone: 30 refusals in
+        // a row, all identical, and the backstop never once fired because the
+        // refusal returned before reaching it.
+        val goal = args.optString("expect").lowercase().trim()
+        if (goal.isNotEmpty() && goal == huntFor) huntSwipes++ else { huntFor = goal; huntSwipes = 1 }
+
+        // She will not stop on her own. She has hammered a blocked action
+        // eleven times before, and thirty times here, so refusing has to cost
+        // her something more each time it is ignored.
+        if (huntSwipes >= 8) {
+          Log.w(TAG, "HUNT HALTED after $huntSwipes swipes for \"$goal\"")
+          huntFor = ""; huntSwipes = 0
+          taskActive = false
+          pendingLook = true
+          return JSONObject()
+            .put("ok", false)
+            .put("stop", true)
+            .put(
+              "error",
+              "STOP. You have swiped for the same thing $huntSwipes times and been refused. Swiping is finished — " +
+                "it will not be allowed again for this."
+            )
+            .put(
+              "do_now",
+              "A picture follows. Look at it and TELL THE USER OUT LOUD what is actually on the screen and what you " +
+                "cannot find. Then wait for them. Do not swipe, do not tap at random."
+            )
+            .put("screen_now", screenBrief(dump))
+        }
+        if (huntSwipes >= 4) {
+          Log.w(TAG, "HUNT BLOCKED: $huntSwipes swipes all expecting \"$goal\"")
+          pendingLook = true
+          return JSONObject()
+            .put("ok", false)
+            .put("stop_scrolling", true)
+            .put("swipes_wasted", huntSwipes)
+            .put(
+              "error",
+              "You have swiped $huntSwipes times looking for the same thing. Scrolling is not working and it is " +
+                "very likely already on screen, going past you each time."
+            )
+            .put(
+              "do_now",
+              "STOP scrolling. A picture follows. Read the rows on it one by one and SAY OUT LOUD what you can see. " +
+                "If what you want is there, tap its numbered box. If it truly is not, say so and say which " +
+                "directions you already tried — do not swipe again."
+            )
+            .put("screen_now", screenBrief(dump))
+        }
+
         loopGuard(dump, "swipe:$dir")?.let { return it }
         // Refuse to go looking for something that is already here. She swiped up
         // and down six times hunting for "Wireless debugging" while it sat in
         // the element list in front of her.
         alreadyOnScreen(dump, args.optString("expect"))?.let { return it }
 
-        // Backstop for when the text match misses anyway — the label may be
-        // worded differently from what she is expecting, or split across two
-        // nodes. Whatever the reason, scrolling for the same thing over and
-        // over is not searching, it is thrashing, and the answer is to look.
-        val goal = args.optString("expect").lowercase().trim()
-        if (goal.isNotEmpty() && goal == huntFor) huntSwipes++ else { huntFor = goal; huntSwipes = 1 }
-        if (huntSwipes >= 4) {
-          Log.w(TAG, "HUNT BLOCKED: $huntSwipes swipes all expecting \"$goal\"")
-          huntSwipes = 0
-          pendingLook = true
-          return JSONObject()
-            .put("ok", false)
-            .put("stop_scrolling", true)
-            .put("swipes_wasted", 4)
-            .put(
-              "error",
-              "You have now swiped four times in a row looking for the same thing and you have not found it. " +
-                "Scrolling is not working. It is very likely already on screen and you are going past it."
-            )
-            .put(
-              "do_now",
-              "STOP scrolling. A picture follows. Look at it properly, read the rows one by one, and SAY OUT LOUD " +
-                "what you can see. If what you want is there, tap its numbered box. If it genuinely is not there, " +
-                "say so and say which direction you have already tried, instead of swiping again."
-            )
-            .put("screen_now", screenBrief(dump))
-        }
         // Horizontal swipes have to be a proper FLING or the page springs back.
         // The old 32%-of-width drag over 300ms was too short and too slow to
         // commit a launcher page — it moved halfway and snapped home, which read
