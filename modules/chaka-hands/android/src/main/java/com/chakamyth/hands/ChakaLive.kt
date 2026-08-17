@@ -2430,10 +2430,43 @@ class ChakaLive(
         var here = dump
         var steps = 0
         var atEnd = false
+        val seenAll = LinkedHashSet<String>()
         while (steps <= 25) {
-          Log.i(TAG, "scroll_to step $steps sees: ${screenBrief(here).take(160)}")
+          // Ask Android, not our own flattened copy of the tree. This is the
+          // whole fix: findAccessibilityNodeInfosByText searches text and
+          // content-description across the live window, without the
+          // isVisibleToUser filter, 400-node cap and depth limit that were
+          // losing this row while it sat plainly on screen.
+          val native = runCatching { service.findByText(target) }.getOrNull()
+          if (native != null) {
+            val n = JSONObject(native)
+            Log.i(TAG, "scroll_to '$target' -> FOUND natively after $steps steps: $native")
+            pendingLook = true
+            huntFor = ""; huntSwipes = 0; huntReversals = 0; huntDir = ""
+            val res = JSONObject()
+              .put("ok", true)
+              .put("found", n.optString("label"))
+              .put("steps_scrolled", steps)
+            if (n.has("switch_is")) {
+              res.put("switch_is", n.optString("switch_is"))
+                .put(
+                  "answer",
+                  "\"${n.optString("label")}\" is ${n.optString("switch_is")}. That is read straight off the " +
+                    "control itself, so it is exact — you do not need to squint at a picture to confirm it."
+                )
+                .put(
+                  "to_change_it",
+                  "Tap the SWITCH at x=${n.optInt("switch_cx")} y=${n.optInt("switch_cy")} with tap_at (they are " +
+                    "pixels, not fractions). Tapping the row's words instead opens that setting's own page."
+                )
+            } else {
+              res.put("to_open_it", "Tap it with tap_at at x=${n.optInt("row_cx", n.optInt("cx"))} y=${n.optInt("row_cy", n.optInt("cy"))} (pixels).")
+            }
+            return res.put("screen_now", screenBrief(here))
+          }
+
           findOnScreen(here, words)?.let { found ->
-            Log.i(TAG, "scroll_to '$target' -> found at [${found.optInt("index")}] after $steps steps")
+            Log.i(TAG, "scroll_to '$target' -> found in tree at [${found.optInt("index")}] after $steps steps")
             pendingLook = true
             huntFor = ""; huntSwipes = 0; huntReversals = 0; huntDir = ""
             return JSONObject()
@@ -2441,24 +2474,19 @@ class ChakaLive(
               .put("found", found.optString("label"))
               .put("index", found.optInt("index"))
               .put("steps_scrolled", steps)
-              .apply { found.optString("switch_says").takeIf { it.isNotBlank() }?.let { put("switch_says", it) } }
-              .put(
-                "do_now",
-                "It is on screen NOW. Say out loud what you can see about it, then act on it — tap_index " +
-                  "${found.optInt("index")}, or the switch's own numbered box beside it if you were asked to turn " +
-                  "it on or off. Do not scroll again; you will lose it."
-              )
+              .apply { found.optString("switch_says").takeIf { it.isNotBlank() }?.let { put("switch_is", it) } }
+              .put("do_now", "It is on screen NOW. Say what you can see about it, then act on it — tap_index ${found.optInt("index")}.")
               .put("screen_now", screenBrief(here))
           }
+
+          screenBrief(here).split("  ").filter { it.isNotBlank() }.forEach { seenAll.add(it.trim()) }
           val before = sig(here)
-          service.swipe(cx, from, cx, to, 450)
+          // The list's own scroll action first; a gesture only if it has none.
+          if (!service.scrollList(dirDown)) service.swipe(cx, from, cx, to, 450)
           steps++
-          // Let it actually stop before looking. Reading a moving list is how
-          // rows get skipped, and a skipped row is indistinguishable from one
-          // that is not there.
           var prev = ""
           for (settle in 0 until 6) {
-            Thread.sleep(220)
+            Thread.sleep(200)
             here = runCatching { JSONObject(service.dumpScreen()) }.getOrNull() ?: here
             val nowS = sig(here)
             if (nowS == prev) break
@@ -2467,17 +2495,13 @@ class ChakaLive(
           if (sig(here) == before) { atEnd = true; break }
         }
 
-        val seen = here.optJSONArray("els")?.let { arr ->
-          (0 until minOf(arr.length(), 40)).mapNotNull { k ->
-            arr.optJSONObject(k)?.let { e ->
-              listOf(e.optString("text"), e.optString("desc"))
-                .filter { t -> t.isNotBlank() }.joinToString("/").takeIf { t -> t.isNotBlank() }
-            }
-          }
-        } ?: emptyList()
         Log.w(TAG, "scroll_to '$target' -> NOT found after $steps steps (atEnd=$atEnd)")
-        Log.w(TAG, "scroll_to saw: ${seen.joinToString(" | ").take(700)}")
-        val partial = seen.filter { lbl -> words.any { lbl.lowercase().contains(it) } }
+        // Everything seen across EVERY step, not just the screen it stopped on.
+        // The last-screen-only version answered a question nobody was asking:
+        // it told me where she ended up, when what mattered was what she went
+        // past on the way.
+        Log.w(TAG, "scroll_to saw: ${seenAll.joinToString(" | ").take(900)}")
+        val partial = seenAll.filter { lbl -> words.any { w -> lbl.lowercase().contains(w) } }
         Log.w(TAG, "scroll_to PARTIAL matches for ${words.joinToString("+")}: " +
           (partial.joinToString(" | ").take(500).ifBlank { "(NONE — the row never reached the element list)" }))
         pendingLook = true

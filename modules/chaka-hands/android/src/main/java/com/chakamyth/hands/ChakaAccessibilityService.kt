@@ -71,6 +71,95 @@ class ChakaAccessibilityService : AccessibilityService() {
     return root.toString()
   }
 
+  /**
+   * Android's own search over the live tree, which is what we should have been
+   * using all along instead of matching against our own flattened copy.
+   *
+   * findAccessibilityNodeInfosByText searches text AND content-description
+   * across the whole window, including nodes our collect() drops — it applies
+   * an isVisibleToUser filter, a 400-node cap and a depth limit, any of which
+   * can silently lose a row. "Wireless debugging" was never appearing in that
+   * copy while sitting plainly on screen.
+   *
+   * Returns the row, where to tap it, and — the part that should never have
+   * required eyes — whether its switch is on, read from isChecked.
+   */
+  fun findByText(query: String): String? {
+    val root = rootInActiveWindow ?: return null
+    val q = query.trim()
+    if (q.isEmpty()) return null
+    val hits = runCatching { root.findAccessibilityNodeInfosByText(q) }.getOrNull().orEmpty()
+    if (hits.isEmpty()) return null
+    val node = hits.firstOrNull { it.isVisibleToUser } ?: return null
+
+    val label = node.text?.toString()?.takeIf { it.isNotBlank() }
+      ?: node.contentDescription?.toString() ?: q
+
+    // The row is the nearest clickable ancestor; the label itself usually is
+    // not clickable, which is why tapping the words does nothing on some
+    // screens and navigates away on others.
+    var p: AccessibilityNodeInfo? = node
+    var row: AccessibilityNodeInfo? = null
+    var up = 0
+    while (p != null && up < 8) {
+      if (p.isClickable) { row = p; break }
+      p = p.parent; up++
+    }
+    val toggle = findCheckable(row ?: node, 0)
+
+    val nodeRect = Rect(); node.getBoundsInScreen(nodeRect)
+    val o = JSONObject()
+      .put("label", label)
+      .put("visible", node.isVisibleToUser)
+      .put("cx", nodeRect.centerX())
+      .put("cy", nodeRect.centerY())
+    row?.let {
+      val r = Rect(); it.getBoundsInScreen(r)
+      o.put("row_cx", r.centerX()).put("row_cy", r.centerY())
+    }
+    toggle?.let {
+      val r = Rect(); it.getBoundsInScreen(r)
+      o.put("has_switch", true)
+        .put("switch_is", if (it.isChecked) "ON" else "OFF")
+        .put("switch_cx", r.centerX())
+        .put("switch_cy", r.centerY())
+    }
+    return o.toString()
+  }
+
+  /** First checkable node in this subtree — the switch belonging to a row. */
+  private fun findCheckable(node: AccessibilityNodeInfo?, depth: Int): AccessibilityNodeInfo? {
+    if (node == null || depth > 6) return null
+    if (node.isCheckable) return node
+    for (i in 0 until node.childCount) {
+      findCheckable(node.getChild(i), depth + 1)?.let { return it }
+    }
+    return null
+  }
+
+  /**
+   * Scrolls using the list's OWN scroll action rather than a swipe gesture.
+   * A gesture is a fling the system keeps decelerating, so the tree is read
+   * mid-motion with rows recycled out of it; this moves exactly one page and
+   * reports whether anything actually moved.
+   */
+  fun scrollList(forward: Boolean): Boolean {
+    val root = rootInActiveWindow ?: return false
+    val target = findScrollable(root, 0) ?: return false
+    val action = if (forward) AccessibilityNodeInfo.ACTION_SCROLL_FORWARD
+    else AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD
+    return runCatching { target.performAction(action) }.getOrDefault(false)
+  }
+
+  private fun findScrollable(node: AccessibilityNodeInfo?, depth: Int): AccessibilityNodeInfo? {
+    if (node == null || depth > 25) return null
+    if (node.isScrollable) return node
+    for (i in 0 until node.childCount) {
+      findScrollable(node.getChild(i), depth + 1)?.let { return it }
+    }
+    return null
+  }
+
   private fun collect(node: AccessibilityNodeInfo?, arr: JSONArray, counter: IntArray, depth: Int) {
     if (node == null || counter[0] > 400 || depth > 45) return
 
