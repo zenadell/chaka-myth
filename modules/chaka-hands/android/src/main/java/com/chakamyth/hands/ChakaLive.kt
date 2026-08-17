@@ -2501,7 +2501,26 @@ class ChakaLive(
               .put("screen_now", screenBrief(here))
           }
 
-          screenBrief(here).split("  ").filter { it.isNotBlank() }.forEach { seenAll.add(it.trim()) }
+          // Straight off els, UNCAPPED. seenAll was built from screenBrief, which
+          // stops at 22 labels per screen — so "not in the trace" never meant
+          // "not in the tree", and I twice concluded that it did. A diagnostic
+          // that silently truncates is worse than none: it produces confident
+          // wrong answers.
+          here.optJSONArray("els")?.let { arr ->
+            for (k in 0 until arr.length()) {
+              arr.optJSONObject(k)?.let { e ->
+                listOf(e.optString("text"), e.optString("desc"))
+                  .filter { t -> t.isNotBlank() }.joinToString(" ")
+                  .takeIf { t -> t.isNotBlank() }?.let { seenAll.add(it) }
+              }
+            }
+          }
+          // And say outright whether the platform search can see it from here,
+          // separately from whether our own copy of the tree can.
+          if (steps == 0) {
+            Log.i(TAG, "scroll_to probe: els=${here.optJSONArray("els")?.length() ?: 0} " +
+              "findByText=${runCatching { service.findByText(target) }.getOrNull() ?: "null"}")
+          }
           val before = contentSig(here)
           // The list's own scroll action first — but TRUST NOTHING IT SAYS.
           // performAction returns true off a scrollable that is not the list in
