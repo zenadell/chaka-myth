@@ -2069,7 +2069,10 @@ class ChakaLive(
     // fired every time, was reset every time, and the halt at 8 was unreachable.
     // A guard whose own advice — "stop and look at the screen" — disarms it is
     // not a guard.
-    if (name in TOUCHES_THE_PHONE && name != "swipe") {
+    // scroll_to has to be excluded too, or it resets the very counter it sets a
+    // few lines later and can never reach its own limit. That is exactly what
+    // happened: fifteen identical searches, guard never fired once.
+    if (name in TOUCHES_THE_PHONE && name != "swipe" && name != "scroll_to") {
       huntFor = ""; huntSwipes = 0; huntReversals = 0; huntDir = ""
     }
 
@@ -2391,13 +2394,21 @@ class ChakaLive(
         val dirDown = !args.optString("direction", "down").startsWith("up")
         val w = dump.optInt("w"); val h = dump.optInt("h")
         val cx = w / 2
-        val from = if (dirDown) (h * 0.72).toInt() else (h * 0.28).toInt()
-        val to = if (dirDown) (h * 0.30).toInt() else (h * 0.74).toInt()
+        // Deliberately SHORT and SLOW. A 280ms drag across 672px is a fling:
+        // Samsung keeps decelerating it long after the gesture ends, so every
+        // dump taken afterwards catches a list still in motion with its rows
+        // recycled out of the tree. That is how a search could cross the whole
+        // of Developer options — 16 steps down, 15 back up — and never once see
+        // "Wireless debugging", while the top and bottom screens read perfectly.
+        // About four rows per step, slow enough to scroll rather than throw.
+        val from = if (dirDown) (h * 0.68).toInt() else (h * 0.34).toInt()
+        val to = if (dirDown) (h * 0.36).toInt() else (h * 0.66).toInt()
 
         var here = dump
         var steps = 0
         var atEnd = false
         while (steps <= 25) {
+          Log.i(TAG, "scroll_to step $steps sees: ${screenBrief(here).take(160)}")
           findOnScreen(here, words)?.let { found ->
             Log.i(TAG, "scroll_to '$target' -> found at [${found.optInt("index")}] after $steps steps")
             pendingLook = true
@@ -2417,10 +2428,19 @@ class ChakaLive(
               .put("screen_now", screenBrief(here))
           }
           val before = sig(here)
-          service.swipe(cx, from, cx, to, 280)
+          service.swipe(cx, from, cx, to, 450)
           steps++
-          Thread.sleep(520)
-          here = runCatching { JSONObject(service.dumpScreen()) }.getOrNull() ?: here
+          // Let it actually stop before looking. Reading a moving list is how
+          // rows get skipped, and a skipped row is indistinguishable from one
+          // that is not there.
+          var prev = ""
+          for (settle in 0 until 6) {
+            Thread.sleep(220)
+            here = runCatching { JSONObject(service.dumpScreen()) }.getOrNull() ?: here
+            val nowS = sig(here)
+            if (nowS == prev) break
+            prev = nowS
+          }
           if (sig(here) == before) { atEnd = true; break }
         }
 
