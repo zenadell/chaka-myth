@@ -1564,7 +1564,13 @@ class ChakaLive(
     val els = dump.optJSONArray("els") ?: return null
     for (k in 0 until els.length()) {
       val e = els.optJSONObject(k) ?: continue
-      val label = e.optString("text", e.optString("desc", ""))
+      // Both, joined. On the row we keep failing to find, the title TextView
+      // has text="Wireless debugging" and is NOT clickable, while the switch
+      // beside it has text="" and content-desc="Wireless debugging". Reading
+      // one field and falling back to the other finds whichever node comes
+      // first and misses the one that actually matters.
+      val label = listOf(e.optString("text"), e.optString("desc"))
+        .filter { it.isNotBlank() }.joinToString(" ")
       if (label.isBlank()) continue
       val l = label.lowercase()
       if (words.all { l.contains(it) }) {
@@ -2359,6 +2365,25 @@ class ChakaLive(
       // element tree answers it exactly, every time, for free.
       "scroll_to" -> {
         val target = args.optString("target").trim()
+        // Same guard as swiping, for the same reason: she called this fifteen
+        // times for one target, alternating direction, once it started failing.
+        val hkey = "scrollto:${target.lowercase()}"
+        if (hkey == huntFor) huntSwipes++ else { huntFor = hkey; huntSwipes = 1; huntReversals = 0 }
+        if (huntSwipes >= 3) {
+          Log.w(TAG, "scroll_to REFUSED — $huntSwipes searches for '$target'")
+          huntFor = ""; huntSwipes = 0
+          pendingLook = true
+          return JSONObject()
+            .put("ok", false)
+            .put("error", "You have searched for \"$target\" $huntSwipes times and it is not being found by that name.")
+            .put(
+              "do_now",
+              "Searching again will not help. A picture follows: LOOK at it and read what the row is ACTUALLY " +
+                "called, then either scroll_to those exact words, or tap its numbered box directly. If you cannot " +
+                "see it at all, say so out loud and tell the user what you can see instead."
+            )
+            .put("screen_now", screenBrief(dump))
+        }
         val words = target.lowercase().split(Regex("[^a-z0-9]+")).filter { it.length > 2 }
         if (words.isEmpty()) {
           return JSONObject().put("ok", false).put("error", "scroll_to needs a target, e.g. 'Wireless debugging'.")
@@ -2399,7 +2424,16 @@ class ChakaLive(
           if (sig(here) == before) { atEnd = true; break }
         }
 
+        val seen = here.optJSONArray("els")?.let { arr ->
+          (0 until minOf(arr.length(), 40)).mapNotNull { k ->
+            arr.optJSONObject(k)?.let { e ->
+              listOf(e.optString("text"), e.optString("desc"))
+                .filter { t -> t.isNotBlank() }.joinToString("/").takeIf { t -> t.isNotBlank() }
+            }
+          }
+        } ?: emptyList()
         Log.w(TAG, "scroll_to '$target' -> NOT found after $steps steps (atEnd=$atEnd)")
+        Log.w(TAG, "scroll_to saw: ${seen.joinToString(" | ").take(700)}")
         pendingLook = true
         JSONObject()
           .put("ok", false)
