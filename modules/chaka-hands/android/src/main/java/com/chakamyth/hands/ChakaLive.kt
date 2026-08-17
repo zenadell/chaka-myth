@@ -1721,7 +1721,8 @@ class ChakaLive(
     for (k in 0 until els.length()) {
       if (n >= 22) break
       val e = els.optJSONObject(k) ?: continue
-      val label = e.optString("text", e.optString("desc", ""))
+      val label = listOf(e.optString("text"), e.optString("desc"))
+        .filter { it.isNotBlank() }.joinToString(" ")
       if (label.isBlank()) continue
       sb.append("[").append(e.optInt("i")).append("] ").append(label.take(34))
       if (e.optBoolean("toggle")) sb.append(if (e.optBoolean("on")) "(ON)" else "(OFF)")
@@ -2454,6 +2455,9 @@ class ChakaLive(
         } ?: emptyList()
         Log.w(TAG, "scroll_to '$target' -> NOT found after $steps steps (atEnd=$atEnd)")
         Log.w(TAG, "scroll_to saw: ${seen.joinToString(" | ").take(700)}")
+        val partial = seen.filter { lbl -> words.any { lbl.lowercase().contains(it) } }
+        Log.w(TAG, "scroll_to PARTIAL matches for ${words.joinToString("+")}: " +
+          (partial.joinToString(" | ").take(500).ifBlank { "(NONE — the row never reached the element list)" }))
         pendingLook = true
         JSONObject()
           .put("ok", false)
