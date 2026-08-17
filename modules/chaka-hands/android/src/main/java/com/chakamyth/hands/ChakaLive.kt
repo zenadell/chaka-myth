@@ -813,6 +813,28 @@ class ChakaLive(
       }
       ws.send(JSONObject().put("toolResponse", JSONObject().put("functionResponses", responses)).toString())
 
+      // Deliver a promised look NOW, not at the end of the turn.
+      //
+      // pendingLook was only ever consumed on turnComplete. She chains ten or
+      // fifteen tool calls inside ONE turn, so every picture a guard promised
+      // her - after a MISMATCH, a refused scroll, a failed search - sat queued
+      // behind the whole chain and arrived long after the moment it was for,
+      // if at all. That is why it looked like she chose not to use her eyes:
+      // we kept telling her a picture was coming and then not sending it.
+      //
+      // A video frame opens no turn, so this cannot interrupt her. The flag is
+      // deliberately NOT cleared: the reconciliation prompt still goes at
+      // turnComplete, where forcing her to stop and answer is the point.
+      if (pendingLook) {
+        Thread {
+          Thread.sleep(350)
+          if (!cancelled && ready) {
+            val d = runCatching { JSONObject(service.dumpScreen()) }.getOrNull()
+            sendFrame(ws, force = true, forSig = d?.let { sig(it) } ?: "", marks = d?.optJSONArray("els"))
+          }
+        }.also { it.isDaemon = true }.start()
+      }
+
       return
     }
 
