@@ -1,112 +1,134 @@
 # Chaka-Myth — handoff
 
-## Where this stands (v6.1.0, ebc2b47)
+## Read this first
 
-Vision before and after every action is **built and installed, not yet watched
-running**. Start Live Mode and check the log before trusting it — see
-"Verify this first" below.
+The one thing that worked all session was **instrumentation**. Every confident
+explanation I reasoned my way to was wrong — five in a row on a single row of a
+single screen — and every real step forward came from adding a log line and
+looking. If you find yourself about to build a fix from a theory, add the
+diagnostic instead. It is faster, and it does not cost the owner a test run.
 
-Two faults were found, and they explain the reported failures between them:
+Current build: **7.7.0**, installed on the A05.
 
-1. **`startFrameLoop` was never called.** It had been dead since 834628f while
-   the system instruction told her "frames stream to you" and, after every
-   action, "the next frames show the result". She had no vision at all and had
-   been told twice that she did — which is why she described screens she had
-   never seen.
-2. **Screenshots were sent as `clientContent`.** On the 3.x live models that is
-   only accepted for seeding history before the first model turn; mid-session
-   it is not a way to say anything. The logs show each injection followed
-   ~100ms later by `interrupted by user`, then the same failed tap a second
-   later. 27 of them in four minutes.
+## The open bug
 
-Now: frames stream continuously over `realtimeInput.video`, `ensureSeen()`
-guarantees a picture of the screen has left the device before any acting tool
-fires, and `withOutcome` pushes the resulting screen before the tool result
-reaches her. All text goes over `realtimeInput.text`.
+`scroll_to "Wireless debugging"` cannot find that row on Developer options,
+while `uiautomator` reports `text="Wireless debugging"` at `[52,389][357,433]`
+on the same screen. Its neighbours are found fine — the diagnostic prints:
 
-## Verify this first
-
-```bash
-adb -s "$PORT" logcat -v time -s ChakaLive:V | grep -E "vision:|look-before-act|rejected|frame loop"
+```
+PARTIAL matches for wireless+debugging:
+  [27] Debugging | [6] Revoke USB debugging authorisation
+  [14] Wireless display certification | [15] Show options for wireless display
 ```
 
-- `vision: N frames streamed` climbing = she can see. If it never appears, she
-  is still blind and nothing else in this file matters.
-- No `rejected (1007)`. If one appears right after a `realtimeInput.text`, the
-  log now says so outright — that would mean the text shape is wrong and
-  `sendText` has to go back to `clientContent`.
-- `injecting screenshot` → `interrupted` → same tap repeated should be gone.
+So the list is being traversed correctly and this one row is invisible to us.
+Both our own tree walk (`collect`) and Android's `findAccessibilityNodeInfosByText`
+miss it.
 
-## Still open
+**Ruled out by testing, do not re-try these:**
 
-- **The drive/nudge/correction pushes were all going down the dead
-  clientContent path too.** They now work for the first time. Watch that she
-  isn't over-driven as a result — the caps (`autoContinues > 30`, `drives >= 50`,
-  `MIN_DRIVE_GAP_MS`) were tuned while those messages were being half-ignored.
-- Only then optimise: smaller frames, longer heartbeat, skipping the pre-action
-  frame on a screen she has already been shown unchanged.
+- filler words in the matcher (fixed, was real, not this)
+- single-word vs all-word matching (fixed, was real, not this)
+- gesture flinging past the row (fixed, was real, not this)
+- reading `text` vs `content-desc` (fixed, was real, not this)
+- `isVisibleToUser` on `findByText` (relaxed in 7.7.0 — **did not change anything**)
 
-## State
+**Next hypothesis, untested:** the node lives in a window that
+`rootInActiveWindow` does not cover. Samsung splits parts of Settings across
+windows; `uiautomator` reads them all and we read one. Nothing in the codebase
+calls `getWindows()`. Dump `getWindows()` on that screen and compare. If that is
+it, `dumpScreen` has been silently missing content on other screens too.
 
-Live Mode is `modules/chaka-hands/android/src/main/java/com/chakamyth/hands/ChakaLive.kt`
-— a native Gemini Live session (`gemini-3.1-flash-live-preview`), speech-to-speech,
-that watches the screen and acts through tool calls. Native because RN's JS thread
-freezes when the app is backgrounded.
+**Fallback worth building either way:** the owner found the row by hand using the
+Settings search bar. Type the name, tap the result. Make it a deliberate route,
+not a fallback.
 
-Working and verified on device: goal lock (new instructions mid-task are queued and
-confirmed, not applied), hard stop, action-effect verification, loop/oscillation
-guards, `task_done` gated on proof, plan memory, persistent `remember`/`recall`
-shared with the chat side, echo gating, drag/hold for pickers and icons, polling
-`wait`.
+## Verified working (do not regress these)
 
-Read `git log` — every commit explains the failure it fixes and why.
+Each was measured, on device or in the browser probe:
 
-## A warning worth heeding
+- **Transport.** `clientContent` is not accepted mid-session on 3.x live models.
+  All text and vision go over `realtimeInput`. Screenshots used to arrive as an
+  interruption she never saw — 27 of them in one four-minute recording.
+- **Vision.** `startFrameLoop` had been dead since 834628f while the prompt told
+  her frames were streaming. It runs; a frame goes out before every action and
+  after every one; ~111 frames in a normal session.
+- **Frame rate.** Change-driven only. 1 FPS streaming does not make her
+  attentive, it makes her **mute** — she stopped answering "say the word HELLO"
+  with the socket open. `834628f` said this three months ago and was right.
+- **Her memory is words, not pictures.** A frame she does not put into words is
+  gone within tens of seconds. Probe: 45s gap and no narration → fails; same gap
+  having said it aloud → passes.
+- **Set-of-Marks.** Existed since v2.1.5, used by ChakaOperator, and Live Mode
+  passed `null`. Now drawn — `marks=25..31` in the log. Coordinates measured
+  15–55px error with one dead tap; marks were exact.
+- **`mediaResolution`** belongs in `generationConfig`. At the top of `setup` the
+  server closes 1007 and every session dies on connect.
+- **`contentSig`** sorts labels before hashing. `sig()` hashes in tree order and
+  the order is unstable, so a stationary screen looked like it was changing —
+  which silently defeated every end-of-list and no-progress check built on it.
 
-Three separate bugs in one session were *guards that caused the problem they were
-meant to prevent*: a nudge loop killed the socket, VAD tuning made her mute, a
-false-claim detector looped her speech. Two more were stop-word rules that froze
-her on ordinary instructions ("don't create a new one, copy the one from before").
+## The recurring failure mode: guards that disarm themselves
 
-Test each guard against **normal speech and normal screens** before adding another.
+Six times this session a guard produced the behaviour it existed to prevent:
+
+- the hunt counter sat below the guards, so a refused swipe never counted
+- `read_screen` reset the hunt, so "stop and look" disarmed the thing telling her to
+- `scroll_to` reset its own counter and could never reach its limit
+- "don't guess and don't say you don't know" left her silent for four minutes
+- `alreadyOnScreen` matched a section heading and blocked scrolling she needed
+- blocking at four swipes wedged her against a list that needs ten
+
+Before adding a guard, ask what it does when she obeys it, and what it does on a
+list that is simply long. Test against normal screens, not the failure you have
+in mind.
+
+## Also outstanding
+
+- **`task_done` is satisfiable by asserting twice.** She twice reported
+  "wireless debugging is on" without having read it this session. A claim about a
+  setting's state should have to cite a `switch_is` reading from `findByText`.
+- **Browser tasks.** In Chrome the tree is nearly empty, so few marks are drawn
+  and she falls back to `tap_at` coordinates — one API-key session logged ~30
+  `tap_at` calls and 19 MISMATCHes. Marks fix native apps and do little here.
+- **Frame size.** Marks roughly double it (82KB vs 46KB); ten `takeScreenshot`
+  rate-limit failures during one swipe storm.
+- **`git push`** has been blocked by the permission classifier all session. The
+  remote is set; the owner runs `git push -u origin main`.
 
 ## Device
 
-Wireless debugging over ADB — no cable (the USB port is dead).
-
-Address it by its **mDNS service name**, which is stable, rather than by IP:port,
-which changes on every reconnect:
+Wireless debugging, no cable (the USB port is dead). Address it by its **stable
+mDNS name**, not the rotating IP:port:
 
 ```bash
 export PATH="$PATH:/opt/homebrew/share/android-commandlinetools/platform-tools"
 adb devices -l
 ```
 
-The A05 shows up as `adb-R94XC0DKS0F-wz6HqL._adb-tls-connect._tcp` and that whole
-string works as the `-s` serial. Chasing the rotating port via `adb mdns services`
-is unnecessary and unreliable — and note **`timeout` does not exist on macOS**, so
-any discovery loop built around it fails silently and looks like "phone offline".
-
-If pairing is lost, ask for a fresh code from Settings → Developer options →
-Wireless debugging → Pair device with pairing code.
+It appears as `adb-R94XC0DKS0F-wz6HqL._adb-tls-connect._tcp`, and that whole
+string works as the `-s` serial. **macOS has no `timeout`** — a discovery loop
+built around it fails silently and looks like "phone offline".
 
 Build, install, watch:
 
 ```bash
 cd android && ANDROID_HOME=/opt/homebrew/share/android-commandlinetools \
   ./gradlew :app:assembleRelease -PreactNativeArchitectures=arm64-v8a
-adb -s "$PORT" install -r ../chaka-myth-<version>.apk
-adb -s "$PORT" logcat -v time -s ChakaLive:V
 ```
 
-Bump the version in `app.json` only — `build.gradle` derives from it.
+Check `versionName` from `dumpsys` after installing, not the filename — a failed
+build once shipped an APK whose name and contents disagreed. Bump the version in
+`app.json` only. Clear the logcat buffer when capturing, or you will read an old
+session as if it were the current one (this cost an hour).
 
-If a build fails with a path that no longer exists, delete
-`android/build/generated/autolinking/` and rebuild.
+Log tags: `ChakaLive:V`, and `ChakaHands:V` for `marks=N`.
 
 ## Context
 
-Testing happens on the owner's mother's Galaxy A05. His own phone — a Galaxy S10,
-his late father's — has a broken screen and cannot be touched; making Chaka good
-enough to run it is the point of the project. Watch the logs and diagnose from
-them rather than guessing; he tests continuously and reports precisely.
+Testing happens on the owner's mother's Galaxy A05. His own phone — a Galaxy
+S10, his late father's — has a broken screen and cannot be touched; making Chaka
+good enough to run it is the point of the project. He tests continuously and
+reports precisely. Diagnose from the logs, and when you do not have the log,
+say so rather than reasoning from the last one you saw.
