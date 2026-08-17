@@ -1754,6 +1754,28 @@ class ChakaLive(
     return sb.toString().trim().ifEmpty { "(nothing readable)" }
   }
 
+  /**
+   * WHAT is on screen, regardless of the order the tree hands it to us.
+   *
+   * sig() hashes the element array in order, and the order is not stable: the
+   * same unchanged screen comes back as "[0] Developer options, [1] Navigate
+   * up" one moment and "[0] Navigate up, [1] Developer options" the next. So a
+   * stationary screen looked like it was changing — which defeated the
+   * end-of-list check (it never fired) and made a scroll that moved nothing
+   * look like it had worked. Seventeen steps, one screen, no scrolling.
+   */
+  private fun contentSig(dump: JSONObject): String {
+    val els = dump.optJSONArray("els") ?: return ""
+    return (0 until els.length())
+      .mapNotNull { k ->
+        els.optJSONObject(k)?.let { e ->
+          listOf(e.optString("text"), e.optString("desc"))
+            .filter { it.isNotBlank() }.joinToString(" ").takeIf { it.isNotBlank() }
+        }
+      }
+      .sorted().joinToString("|").hashCode().toString()
+  }
+
   private fun sig(dump: JSONObject): String =
     dump.optJSONArray("els")?.toString()?.hashCode()?.toString() ?: ""
 
@@ -2480,19 +2502,35 @@ class ChakaLive(
           }
 
           screenBrief(here).split("  ").filter { it.isNotBlank() }.forEach { seenAll.add(it.trim()) }
-          val before = sig(here)
-          // The list's own scroll action first; a gesture only if it has none.
-          if (!service.scrollList(dirDown)) service.swipe(cx, from, cx, to, 450)
+          val before = contentSig(here)
+          // The list's own scroll action first — but TRUST NOTHING IT SAYS.
+          // performAction returns true off a scrollable that is not the list in
+          // front of us, and then nothing moves while we congratulate ourselves.
+          // The only evidence that a scroll worked is different content.
+          service.scrollList(dirDown)
           steps++
           var prev = ""
           for (settle in 0 until 6) {
             Thread.sleep(200)
             here = runCatching { JSONObject(service.dumpScreen()) }.getOrNull() ?: here
-            val nowS = sig(here)
+            val nowS = contentSig(here)
             if (nowS == prev) break
             prev = nowS
           }
-          if (sig(here) == before) { atEnd = true; break }
+          if (contentSig(here) == before) {
+            // The action claimed success and moved nothing. Fall back to a real
+            // gesture before believing we have reached the end.
+            service.swipe(cx, from, cx, to, 450)
+            var p2 = ""
+            for (settle in 0 until 6) {
+              Thread.sleep(200)
+              here = runCatching { JSONObject(service.dumpScreen()) }.getOrNull() ?: here
+              val nowS = contentSig(here)
+              if (nowS == p2) break
+              p2 = nowS
+            }
+            if (contentSig(here) == before) { atEnd = true; break }
+          }
         }
 
         Log.w(TAG, "scroll_to '$target' -> NOT found after $steps steps (atEnd=$atEnd)")
