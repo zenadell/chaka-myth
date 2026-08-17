@@ -90,7 +90,17 @@ class ChakaAccessibilityService : AccessibilityService() {
     if (q.isEmpty()) return null
     val hits = runCatching { root.findAccessibilityNodeInfosByText(q) }.getOrNull().orEmpty()
     if (hits.isEmpty()) return null
-    val node = hits.firstOrNull { it.isVisibleToUser } ?: return null
+    // Do NOT require isVisibleToUser. Samsung reports this false for rows that
+    // are plainly drawn on screen — it is the one filter both this search and
+    // collect() shared, and "Wireless debugging" went missing from both while
+    // uiautomator found it at [52,389][357,433]. If the node is in the tree at
+    // all we want it; if it is genuinely off screen, ask the system to bring it
+    // into view rather than scrolling blindly past it.
+    val node = hits.firstOrNull { it.isVisibleToUser } ?: hits.firstOrNull() ?: return null
+    if (!node.isVisibleToUser) {
+      runCatching { node.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_SHOW_ON_SCREEN.id) }
+      Thread.sleep(400)
+    }
 
     val label = node.text?.toString()?.takeIf { it.isNotBlank() }
       ?: node.contentDescription?.toString() ?: q

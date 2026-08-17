@@ -2538,7 +2538,7 @@ class ChakaLive(
         // The last-screen-only version answered a question nobody was asking:
         // it told me where she ended up, when what mattered was what she went
         // past on the way.
-        Log.w(TAG, "scroll_to saw: ${seenAll.joinToString(" | ").take(900)}")
+        Log.w(TAG, "scroll_to saw (${seenAll.size}): ${seenAll.joinToString(" | ").take(3000)}")
         val partial = seenAll.filter { lbl -> words.any { w -> lbl.lowercase().contains(w) } }
         Log.w(TAG, "scroll_to PARTIAL matches for ${words.joinToString("+")}: " +
           (partial.joinToString(" | ").take(500).ifBlank { "(NONE — the row never reached the element list)" }))
