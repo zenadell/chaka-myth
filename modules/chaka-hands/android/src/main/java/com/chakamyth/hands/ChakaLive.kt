@@ -240,7 +240,7 @@ class ChakaLive(
     // must never fire against a screen she has not been shown.
     private val TOUCHES_THE_PHONE = setOf(
       "tap_index", "tap_at", "long_press_at", "type_text", "press_enter",
-      "swipe", "drag", "press_button", "open_app", "open_app_drawer", "navigate"
+      "swipe", "scroll_to", "drag", "press_button", "open_app", "open_app_drawer", "navigate"
     )
     // A halt: unambiguous, and fine as an opener.
     private val STOP_WORDS = listOf("stop", "wait", "cancel", "abort", "hold on", "quit")
@@ -490,6 +490,7 @@ class ChakaLive(
       "- When you call task_done, SAY what you did and anything the user needs to know. Never finish in silence and make them ask 'are you done?'.\n" +
       "- If the connection drops (they may be on a call), pick straight back up when you return — say you're back and resume any unfinished task.\n" +
       "- OBSTACLES ARE YOURS TO CLEAR, not theirs. Permission dialogs (Allow / While using the app), cookie or consent banners, ads, 'Not now', update prompts, rating popups — deal with them yourself the instant they appear: accept what the task needs, dismiss or close anything it doesn't. Never stop and stare at a popup waiting for instructions.\n" +
+      "- TO FIND SOMETHING BY NAME, USE scroll_to — NEVER SWIPE. scroll_to scrolls AND checks the screen after every single step, stops the instant your target appears, and hands you its index and switch state. It cannot scroll past what you asked for; you can, and you have, many times, up and down past the very row you were sent to find. If you catch yourself swiping to look for something, you are doing it wrong: stop and call scroll_to with the words as they appear on screen. Swipe is only for reading a page you are already on.\n" +
       "- SWIPE MEANS CONTENT, NOT FINGER. 'down' reveals what is FURTHER DOWN the page; 'up' goes back toward the TOP. Never swipe to reach the app drawer or notifications — use open_app_drawer or press_button instead, so you can't land in the wrong place.\n" +
       "\nYOU CANNOT FAKE PERCEPTION. The system knows exactly what it has shown you and which tools you called. You can see the screen, so there is never an excuse for describing it wrongly — but describing it from memory, or from what you assume your last action did, is inventing it just the same. Say what is in the newest picture. And saying you did something without calling the tool will be caught and corrected in front of the user.\n" +
       "\nHOW YOU WORK — LOOK, ACT, CHECK. This is the loop, every step, without exception:\n" +
@@ -579,6 +580,14 @@ class ChakaLive(
           .put("amount", JSONObject().put("type", "string").put("description", "tiny|normal|long"))
           .put("expect", JSONObject().put("type", "string").put("description", "REQUIRED. What should come into view, e.g. 'the second page of the app drawer'.")),
         listOf("direction", "expect")))
+      .put(fn(
+        "scroll_to",
+        "Find something by NAME and stop the moment it is on screen. ALWAYS USE THIS INSTEAD OF SWIPING when you are looking for a named thing — a setting, a row, a contact, a button. The phone does the scrolling AND the looking: it checks the screen after every single step and stops the instant your target appears, then hands you its exact index and, for a switch, whether it is on or off. It physically cannot scroll past what you asked for, and it knows when it has reached the end of the list. Swiping by hand to search is how things get missed.",
+        JSONObject()
+          .put("target", JSONObject().put("type", "string").put("description", "The exact words on screen, e.g. 'Wireless debugging'. Use the real label, not a description of it."))
+          .put("direction", JSONObject().put("type", "string").put("description", "down (further down the page, the default) or up")),
+        listOf("target")
+      ))
       .put(fn("press_button", "Press a system button: back, home, recents, notifications, quick_settings.", props("button", "string", "back|home|recents|notifications|quick_settings"), listOf("button")))
       .put(fn("open_app", "Launch an app by name.", props("app", "string", "App name, e.g. spotify"), listOf("app")))
       .put(fn("navigate", "Open a website URL in the browser.", props("url", "string", "Full URL"), listOf("url")))
@@ -1545,6 +1554,32 @@ class ChakaLive(
    * and stop her. Scrolling past a visible target is one of the easiest ways to
    * lose a task, and it looks — correctly — like she isn't seeing the screen.
    */
+  /**
+   * Finds a named row on the current screen. Every content word must appear in
+   * one label, so "Wireless debugging" does not match the section heading
+   * "Debugging" — the mistake that had her tapping a title and getting nowhere.
+   */
+  private fun findOnScreen(dump: JSONObject, words: List<String>): JSONObject? {
+    if (words.isEmpty()) return null
+    val els = dump.optJSONArray("els") ?: return null
+    for (k in 0 until els.length()) {
+      val e = els.optJSONObject(k) ?: continue
+      val label = e.optString("text", e.optString("desc", ""))
+      if (label.isBlank()) continue
+      val l = label.lowercase()
+      if (words.all { l.contains(it) }) {
+        return JSONObject()
+          .put("index", e.optInt("i"))
+          .put("label", label)
+          .put("clickable", e.optBoolean("clickable", false))
+          .apply {
+            if (e.optBoolean("toggle")) put("switch_says", if (e.optBoolean("on")) "ON" else "OFF")
+          }
+      }
+    }
+    return null
+  }
+
   private fun alreadyOnScreen(dump: JSONObject, expect: String): JSONObject? {
     if (expect.isBlank()) return null
     val els = dump.optJSONArray("els") ?: return null
@@ -1809,8 +1844,21 @@ class ChakaLive(
     consecutiveBlocks = 0
 
     // Compare the outcome against what she said she expected.
+    val expectWas = pendingExpect
     val verdict = verifyEffect(pendingExpect, after, changed, action)
     pendingExpect = ""
+    // A swipe that just brought the thing she was hunting for into view has to
+    // announce itself. She has scrolled straight past the answer repeatedly
+    // while it sat in screen_now, unread, at the bottom of a wall of text.
+    if (action.startsWith("swipe")) {
+      alreadyOnScreen(after, expectWas)?.let { hit ->
+        result.put(
+          "STOP_IT_IS_HERE",
+          "\"${hit.optString("already_visible")}\" is ON SCREEN NOW, at index [${hit.optInt("index")}]. " +
+            "You found it. Stop scrolling, say what you can see about it, and act on it."
+        )
+      }
+    }
     if (!changed || verdict.optString("effect") == "MISMATCH") noProgressRun++ else noProgressRun = 0
     if (verdict.optString("effect") == "MISMATCH") {
       result.put("verification", verdict)
@@ -2301,6 +2349,79 @@ class ChakaLive(
           }
           res
         }
+      }
+      // Searching by name is a solved problem the moment the phone does the
+      // looking. She scrolled past Wireless debugging over and over, up and
+      // down, having ALREADY read it out correctly minutes earlier — so this is
+      // not her forgetting what the setting is. It is that "is it on screen
+      // now?" is a question she has to re-answer after every swipe, from a
+      // picture that has already faded, while she fires the next swipe. The
+      // element tree answers it exactly, every time, for free.
+      "scroll_to" -> {
+        val target = args.optString("target").trim()
+        val words = target.lowercase().split(Regex("[^a-z0-9]+")).filter { it.length > 2 }
+        if (words.isEmpty()) {
+          return JSONObject().put("ok", false).put("error", "scroll_to needs a target, e.g. 'Wireless debugging'.")
+        }
+        val dirDown = !args.optString("direction", "down").startsWith("up")
+        val w = dump.optInt("w"); val h = dump.optInt("h")
+        val cx = w / 2
+        val from = if (dirDown) (h * 0.72).toInt() else (h * 0.28).toInt()
+        val to = if (dirDown) (h * 0.30).toInt() else (h * 0.74).toInt()
+
+        var here = dump
+        var steps = 0
+        var atEnd = false
+        while (steps <= 25) {
+          findOnScreen(here, words)?.let { found ->
+            Log.i(TAG, "scroll_to '$target' -> found at [${found.optInt("index")}] after $steps steps")
+            pendingLook = true
+            huntFor = ""; huntSwipes = 0; huntReversals = 0; huntDir = ""
+            return JSONObject()
+              .put("ok", true)
+              .put("found", found.optString("label"))
+              .put("index", found.optInt("index"))
+              .put("steps_scrolled", steps)
+              .apply { found.optString("switch_says").takeIf { it.isNotBlank() }?.let { put("switch_says", it) } }
+              .put(
+                "do_now",
+                "It is on screen NOW. Say out loud what you can see about it, then act on it — tap_index " +
+                  "${found.optInt("index")}, or the switch's own numbered box beside it if you were asked to turn " +
+                  "it on or off. Do not scroll again; you will lose it."
+              )
+              .put("screen_now", screenBrief(here))
+          }
+          val before = sig(here)
+          service.swipe(cx, from, cx, to, 280)
+          steps++
+          Thread.sleep(520)
+          here = runCatching { JSONObject(service.dumpScreen()) }.getOrNull() ?: here
+          if (sig(here) == before) { atEnd = true; break }
+        }
+
+        Log.w(TAG, "scroll_to '$target' -> NOT found after $steps steps (atEnd=$atEnd)")
+        pendingLook = true
+        JSONObject()
+          .put("ok", false)
+          .put("not_found", target)
+          .put("steps_scrolled", steps)
+          .put("reached_end_of_list", atEnd)
+          .put(
+            "error",
+            if (atEnd)
+              "\"$target\" is not on this page. The list stopped moving after $steps steps, so that is the whole of " +
+                "it and those exact words are not here."
+            else
+              "\"$target\" did not appear in $steps steps of scrolling."
+          )
+          .put(
+            "do_now",
+            "Do NOT start swiping by hand — that is what this tool replaced. Either try scroll_to again with the " +
+              "OTHER direction, or with the words as they really appear on screen (shorter is safer: \"Wireless\" " +
+              "rather than \"Wireless debugging settings\"). A picture follows; read it and say what is actually " +
+              "there. If it genuinely is not on this screen, tell the user."
+          )
+          .put("screen_now", screenBrief(here))
       }
       "swipe" -> {
         val w = dump.optInt("w"); val h = dump.optInt("h")
