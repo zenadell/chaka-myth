@@ -171,7 +171,11 @@ class ChakaAccessibilityService : AccessibilityService() {
   }
 
   private fun collect(node: AccessibilityNodeInfo?, arr: JSONArray, counter: IntArray, depth: Int) {
-    if (node == null || counter[0] > 400 || depth > 45) return
+    // Raised with flagIncludeNotImportantViews: the tree is deeper and wider now
+    // that the system stops pre-filtering it, and a Settings list can bury a row
+    // below the old depth limit. Only nodes we actually keep count toward the
+    // cap, so this bounds the payload, not the walk.
+    if (node == null || counter[0] > 900 || depth > 70) return
 
     val text = node.text?.toString()
     val desc = node.contentDescription?.toString()
