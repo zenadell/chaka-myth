@@ -107,6 +107,24 @@ object ChakaOcr {
     return best
   }
 
+  /**
+   * Every line matching the query, not just the best one.
+   *
+   * Ambiguity is information. "Debugging" on Developer options matches USB
+   * debugging, Wireless debugging and Revoke USB debugging authorisations —
+   * three different settings, one of which turns on remote access to the phone.
+   * Picking the first and proceeding confidently is how an assistant does the
+   * wrong irreversible thing, so the caller is told there were several and can
+   * ask instead of guessing.
+   */
+  fun findAll(lines: List<Found>, query: String): List<Found> {
+    val words = query.lowercase().split(Regex("[^a-z0-9]+")).filter { it.length > 2 }
+    if (words.isEmpty() || lines.isEmpty()) return emptyList()
+    return lines
+      .filter { l -> val hay = l.text.lowercase(); words.all { hay.contains(it) } }
+      .distinctBy { it.text.lowercase().trim() }
+  }
+
   /** For the log and for handing back to her when a search fails. */
   fun asJson(lines: List<Found>, limit: Int = 60): JSONArray {
     val arr = JSONArray()

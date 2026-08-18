@@ -494,6 +494,7 @@ class ChakaLive(
       (memLabels().takeIf { it.isNotEmpty() }?.let {
         "ALREADY IN YOUR MEMORY (use recall to read any of these exactly): ${it.joinToString(", ")}\n"
       } ?: "") +
+      "\nVAGUE MEANS ASK, NOT GUESS. If the request names a CATEGORY rather than an exact control — \"the debugging thing\", \"the wifi setting\", \"that notification thing\", \"the battery one\" — you do not know which they mean, and picking the closest is guessing however confident you feel. Say what the candidates are, in their exact on-screen words, and ask which. \"Do you mean USB debugging or Wireless debugging?\" costs one second. Turning on the wrong one can hand someone remote access to the phone, sign them out, or wipe something, and being right by luck four times teaches them to trust you the fifth time when you are not. The same goes for a person, a file, a chat or an app whose name is not exact: if two things could be meant, ASK.\n" +
       "\nNEVER INVENT A VALUE. Passwords, codes, emails, account names: if the user gave it to you, remember() it the moment you hear it, and recall() it before typing. If it is not in memory, say you do not have it and ask - typing a made-up password is worse than useless, because it looks like it worked and silently isn't the real one.\n" +
       "\nACT — DO NOT TALK ABOUT ACTING. THIS OVERRIDES EVERYTHING ELSE:\n" +
       "- Saying something is NOT doing it. Words change nothing on the phone; only tool calls do.\n" +
@@ -2804,6 +2805,9 @@ class ChakaLive(
         val to = if (dirDown) (h * 0.36).toInt() else (h * 0.66).toInt()
 
         var here = dump
+        // The app we are searching IN. An OCR hit from anywhere else is a
+        // different object that happens to share the words.
+        val searchPkg = dump.optString("pkg").takeIf { it.isNotBlank() }
         var steps = 0
         var atEnd = false
         val seenAll = LinkedHashSet<String>()
@@ -2850,9 +2854,38 @@ class ChakaLive(
           // platform search call reaches it. OCR reads what is actually on the
           // glass, and hands back a real box instead of an estimate, so this
           // fixes finding AND aiming in one move.
-          runCatching { service.findByPixels(target) }.getOrNull()?.let { raw ->
+          // Scoped to the app the search STARTED in. A "Wireless debugging
+          // connected" notification in the shade reads identically to the
+          // Developer options row, and matching it looks like success while
+          // being a different object entirely — I reported one as a fix.
+          runCatching { service.findByPixels(target, searchPkg) }.getOrNull()?.let { raw ->
             val o = JSONObject(raw)
             if (o.optBoolean("found")) {
+              // Several things on screen answer to this name. Choosing one and
+              // acting is how an assistant turns on the wrong thing with total
+              // confidence — "the debugging thing" is USB debugging, Wireless
+              // debugging, or a snoop log, and one of those opens the phone up.
+              if (o.optBoolean("ambiguous")) {
+                val options = o.optJSONArray("also_matched")
+                Log.w(TAG, "scroll_to '$target' AMBIGUOUS: $options")
+                huntFor = ""; huntSwipes = 0; huntReversals = 0; huntDir = ""
+                pendingLook = true
+                return JSONObject()
+                  .put("ok", false)
+                  .put("ambiguous", true)
+                  .put("matches", options)
+                  .put(
+                    "error",
+                    "More than one thing on this screen matches \"$target\": $options. They are different settings."
+                  )
+                  .put(
+                    "do_now",
+                    "Do NOT pick one. ASK the user which they mean, naming the options exactly as they appear, and " +
+                      "wait for their answer. Guessing right is still guessing, and one of these may be something " +
+                      "they did not want touched."
+                  )
+                  .put("screen_now", screenBrief(here))
+              }
               Log.i(TAG, "scroll_to '$target' -> FOUND BY OCR after $steps steps: ${raw.take(200)}")
               pendingLook = true
               huntFor = ""; huntSwipes = 0; huntReversals = 0; huntDir = ""

@@ -847,7 +847,25 @@ class ChakaAccessibilityService : AccessibilityService() {
    * fallback that has no blind spot, and it hands back a real box to tap rather
    * than an estimated fraction.
    */
-  fun findByPixels(query: String): String? {
+  fun findByPixels(query: String): String? = findByPixels(query, null)
+
+  /**
+   * [requirePackage] is what stops OCR reading the wrong screen entirely.
+   *
+   * Pixels cannot lie about what is drawn, but they say nothing about WHERE.
+   * A "Wireless debugging connected" notification in the shade reads exactly
+   * like the Developer options row, and a hit on it is not a hit on the
+   * setting — it is a different object with the same words. Searching within
+   * Settings must not be satisfied by the notification panel.
+   */
+  fun findByPixels(query: String, requirePackage: String?): String? {
+    if (requirePackage != null) {
+      val here = rootInActiveWindow?.packageName?.toString()
+      if (here != null && here != requirePackage) {
+        Log.i("ChakaHands", "OCR skipped: on '$here', expected '$requirePackage'")
+        return JSONObject().put("found", false).put("wrong_screen", here).toString()
+      }
+    }
     val bmp = captureBitmapBlocking()
     if (bmp == null) {
       // Android rate-limits takeScreenshot to about one per second. A loop that
@@ -858,6 +876,7 @@ class ChakaAccessibilityService : AccessibilityService() {
       return null
     }
     val lines = ChakaOcr.readLines(bmp)
+    val all = ChakaOcr.findAll(lines, query)
     val hit = ChakaOcr.find(lines, query)
     Log.i("ChakaHands", "OCR read ${lines.size} lines looking for '$query' -> ${if (hit != null) "HIT" else "no match"}")
     val metrics = resources.displayMetrics
@@ -876,6 +895,12 @@ class ChakaAccessibilityService : AccessibilityService() {
     return JSONObject()
       .put("found", true)
       .put("text", hit.text)
+      .apply {
+        if (all.size > 1) {
+          put("ambiguous", true)
+          put("also_matched", org.json.JSONArray(all.map { it.text }))
+        }
+      }
       .put("cx", (hit.box.centerX() * sx).toInt())
       .put("cy", (hit.box.centerY() * sy).toInt())
       .put("x1", (hit.box.left * sx).toInt())
