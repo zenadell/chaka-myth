@@ -186,6 +186,23 @@ class ChakaLive(
   // previous request, and the off-plan guard allowed it because those words
   // were still in the transcript.
   @Volatile private var currentRequest = ""
+  // A switch-state claim is evidence, not a sentence the model happened to
+  // produce. Keep the last native reading so task_done can require it for
+  // settings checks and changes.
+  @Volatile private var lastSwitchProofLabel = ""
+  @Volatile private var lastSwitchProofState = ""
+  @Volatile private var lastSwitchProofRequest = ""
+  @Volatile private var lastSwitchProofAt = 0L
+  // Once scroll_to has found the requested control, the model must not be
+  // allowed to scroll or freehand-tap past it. The only permitted follow-up is
+  // a native action on that exact target, or reporting its proven state.
+  @Volatile private var lockedTarget = ""
+  @Volatile private var lockedTargetRequest = ""
+  @Volatile private var lockedTargetAt = 0L
+  @Volatile private var lockedTargetHasSwitch = false
+  // Some system settings deserve a deterministic controller, not an LLM tool
+  // loop. While it runs, no model-issued action may race it or scroll away.
+  @Volatile private var nativeSettingsController = false
   // GOAL LOCK. While a task is running the objective is held here and cannot be
   // replaced by something heard mid-execution. A new instruction is queued and
   // she asks before switching, rather than silently abandoning what she is
@@ -240,7 +257,8 @@ class ChakaLive(
     // must never fire against a screen she has not been shown.
     private val TOUCHES_THE_PHONE = setOf(
       "tap_index", "tap_at", "long_press_at", "type_text", "press_enter",
-      "swipe", "scroll_to", "drag", "press_button", "open_app", "open_app_drawer", "navigate"
+      "swipe", "scroll_to", "open_found_target", "set_found_switch", "drag",
+      "press_button", "open_app", "open_app_drawer", "navigate"
     )
     // A halt: unambiguous, and fine as an opener.
     private val STOP_WORDS = listOf("stop", "wait", "cancel", "abort", "hold on", "quit")
@@ -490,7 +508,7 @@ class ChakaLive(
       "- When you call task_done, SAY what you did and anything the user needs to know. Never finish in silence and make them ask 'are you done?'.\n" +
       "- If the connection drops (they may be on a call), pick straight back up when you return — say you're back and resume any unfinished task.\n" +
       "- OBSTACLES ARE YOURS TO CLEAR, not theirs. Permission dialogs (Allow / While using the app), cookie or consent banners, ads, 'Not now', update prompts, rating popups — deal with them yourself the instant they appear: accept what the task needs, dismiss or close anything it doesn't. Never stop and stare at a popup waiting for instructions.\n" +
-      "- TO FIND SOMETHING BY NAME, USE scroll_to — NEVER SWIPE. scroll_to scrolls AND checks the screen after every single step, stops the instant your target appears, and hands you its index and switch state. It cannot scroll past what you asked for; you can, and you have, many times, up and down past the very row you were sent to find. If you catch yourself swiping to look for something, you are doing it wrong: stop and call scroll_to with the words as they appear on screen. Swipe is only for reading a page you are already on.\n" +
+      "- TO FIND SOMETHING BY NAME, USE scroll_to — NEVER SWIPE. scroll_to scrolls AND checks the screen after every single step, stops the instant your target appears, and locks that target so you physically cannot scroll or freehand-tap past it. If it finds a row, call open_found_target; it opens that exact row natively. If it finds a switch, read switch_is or call set_found_switch only when the user asked to change it. Swipe is only for reading a page you are already on.\n" +
       "- SWIPE MEANS CONTENT, NOT FINGER. 'down' reveals what is FURTHER DOWN the page; 'up' goes back toward the TOP. Never swipe to reach the app drawer or notifications — use open_app_drawer or press_button instead, so you can't land in the wrong place.\n" +
       "\nYOU CANNOT FAKE PERCEPTION. The system knows exactly what it has shown you and which tools you called. You can see the screen, so there is never an excuse for describing it wrongly — but describing it from memory, or from what you assume your last action did, is inventing it just the same. Say what is in the newest picture. And saying you did something without calling the tool will be caught and corrected in front of the user.\n" +
       "\nHOW YOU WORK — LOOK, ACT, CHECK. This is the loop, every step, without exception:\n" +
@@ -521,7 +539,8 @@ class ChakaLive(
       "- NEVER CHANGE A SETTING THAT WAS NOT ASKED FOR. No toggling Bluetooth, Wi-Fi, permissions or anything else because you happen to be on that screen. Only touch what the request needs.\n" +
       "- BEING STUCK IS REPORTED, NOT ESCAPED. If a step will not work, you do not quietly go and do something else. Say plainly what you tried, what is blocking you, and ask. Opening an unrelated app while a task is unfinished is the single worst thing you can do - the user walks back to find you browsing something they never asked for.\n" +
       "- READ THE LIST BEFORE YOU SCROLL. Every result gives you screen_now, the things actually on screen. Check it for what you want BEFORE swiping — scrolling past something that is right in front of you is the clearest possible sign you are not looking, and it is how tasks get lost.\n" +
-      "- THE LIST SAYS WHAT IS THERE. THE PICTURE SAYS WHAT STATE IT IS IN. Those are different questions and you must not answer the second from the first. On most Settings screens the switch is a separate unlabelled node, so a row arrives as plain text with no ON or OFF attached — that means UNKNOWN, never OFF. 'Is wireless debugging on?', 'is it enabled?', 'is it checked?', 'did it turn on?' are all questions only your eyes can answer: find the row in the picture, look at the switch beside it, and read it. If it is not on screen yet, scroll until it IS and then look. Never answer a state question from the element list, and never scroll past the very row you were asked about because the list did not label it.\n" +
+      "- SETTING STATE MUST COME FROM NATIVE PROOF. A plain row label means UNKNOWN, never ON or OFF. For 'is wireless debugging on?' and similar questions, call scroll_to. Its switch_is result is read from Android's real checked state and is the answer; if it first finds a row, call open_found_target, then scroll_to the same name again. Never replace that proof with a visual guess, an element-list inference, or more scrolling.\n" +
+      "- SAY IT ONCE, THEN STOP. If you cannot find something or cannot verify it, say so in ONE sentence — what you looked for, where you looked, and what you can see instead — and then WAIT. Repeating \"I could not verify it\" again and again is not reporting, it is nagging, and the user has to shut you up by hand. If you have already said it once, do not say it again unless they ask.\n" +
       "- IF TAPS DO NOTHING, THE SCREEN IS PROBABLY STILL LOADING. Several actions in a row reporting no change usually means the page has not finished drawing - not that you are aiming badly. Call wait (with more seconds) before trying anything else. Tapping a half-drawn screen achieves nothing and shifts the element numbers underneath you.\n" +
       "- A BLANK OR HALF-DRAWN SCREEN MEANS LOADING, NOT FAILURE. Sign-in pages, browsers and anything on a slow connection take a moment. Call wait and look again. NEVER press back on a screen that is still loading - the tap that got you there worked, and going back throws it away and starts you round the loop again.\n" +
       "- CHECKBOXES AND RADIO BUTTONS IN A FORM OR DIALOG: tap the LABEL TEXT beside the control, not the little box. The box itself is often a few pixels and not the clickable node; the row or its text usually is. If tapping the box does nothing, tap the words next to it.\n" +
@@ -582,11 +601,22 @@ class ChakaLive(
         listOf("direction", "expect")))
       .put(fn(
         "scroll_to",
-        "Find something by NAME and stop the moment it is on screen. ALWAYS USE THIS INSTEAD OF SWIPING when you are looking for a named thing — a setting, a row, a contact, a button. The phone does the scrolling AND the looking: it checks the screen after every single step and stops the instant your target appears, then hands you its exact index and, for a switch, whether it is on or off. It physically cannot scroll past what you asked for, and it knows when it has reached the end of the list. Swiping by hand to search is how things get missed.",
+        "Find something by NAME and stop the moment it is on screen. ALWAYS USE THIS INSTEAD OF SWIPING when you are looking for a named thing — a setting, a row, a contact, a button. The phone checks after every step and locks the exact target when found. You cannot scroll, freehand-tap, or accidentally move past a locked target: call open_found_target to open its row, or read switch_is / call set_found_switch for its switch.",
         JSONObject()
           .put("target", JSONObject().put("type", "string").put("description", "The exact words on screen, e.g. 'Wireless debugging'. Use the real label, not a description of it."))
           .put("direction", JSONObject().put("type", "string").put("description", "down (further down the page, the default) or up")),
         listOf("target")
+      ))
+      .put(fn(
+        "open_found_target",
+        "Open the row currently locked by scroll_to. It acts on Android's exact matched node, not a coordinate. Use this after scroll_to finds a row with no switch.",
+        JSONObject()
+      ))
+      .put(fn(
+        "set_found_switch",
+        "Set the switch currently locked by scroll_to, then read its real Android state back. Use only when the user explicitly asked to turn that setting on or off.",
+        props("enabled", "boolean", "true = ON, false = OFF"),
+        listOf("enabled")
       ))
       .put(fn("press_button", "Press a system button: back, home, recents, notifications, quick_settings.", props("button", "string", "back|home|recents|notifications|quick_settings"), listOf("button")))
       .put(fn("open_app", "Launch an app by name.", props("app", "string", "App name, e.g. spotify"), listOf("app")))
@@ -882,6 +912,7 @@ class ChakaLive(
             haltedAt = System.currentTimeMillis()
             taskActive = false
             currentRequest = ""
+            clearSwitchProof()
             autoContinues = 0
             drives = 0
             pendingLook = false
@@ -923,6 +954,7 @@ class ChakaLive(
             // They agreed to the switch we queued, so promote it.
             if (queuedRequest.isNotEmpty() && confirmsSwitch(said)) {
               currentRequest = queuedRequest
+              clearSwitchProof()
               queuedRequest = ""
               plan.clear(); planStep = 0; planGoal = ""
               stateActionCount.clear(); triedFromState.clear(); stateVisits.clear()
@@ -934,6 +966,7 @@ class ChakaLive(
             // previous task is finished as far as she is concerned.
             if (!isFollowUp(said)) {
               currentRequest = heard
+              clearSwitchProof()
               plan.clear(); planStep = 0; planGoal = ""
               stateActionCount.clear(); triedFromState.clear(); stateVisits.clear()
               noProgressRun = 0
@@ -946,6 +979,9 @@ class ChakaLive(
             if (recentSpeech.length > 600) recentSpeech.delete(0, recentSpeech.length - 600)
           }
           Log.i(TAG, "user: $heard")
+          if (currentRequest == heard && startNativeWirelessDebuggingCheck()) {
+            Log.i(TAG, "native Wireless debugging controller started")
+          }
         }
 
       // Accumulate what SHE said this turn, so we can tell talk from action.
@@ -1516,9 +1552,27 @@ class ChakaLive(
   /** Sends a typed/spoken message from the user into the live session. */
   fun say(text: String) {
     val ws = socket ?: return
+    val said = text.trim()
+    if (said.isEmpty()) return
+    // Typed instructions used to bypass inputTranscription entirely, so the
+    // native task/proof guards still described an older request. That made the
+    // safety layer blind precisely when a user was using the text chat.
+    if (!isFollowUp(said.lowercase())) {
+      currentRequest = said
+      clearSwitchProof()
+      plan.clear(); planStep = 0; planGoal = ""
+      stateActionCount.clear(); triedFromState.clear(); stateVisits.clear()
+      noProgressRun = 0
+    }
+    pendingUserWord = said
+    synchronized(recentSpeech) {
+      recentSpeech.append(' ').append(said.lowercase())
+      if (recentSpeech.length > 600) recentSpeech.delete(0, recentSpeech.length - 600)
+    }
     taskActive = true
     nudges = 0
-    sendText(ws, text)
+    startNativeWirelessDebuggingCheck()
+    sendText(ws, said)
   }
 
   /** Label of element [i] on the current screen, if present. */
@@ -1584,6 +1638,8 @@ class ChakaLive(
   private fun findOnScreen(dump: JSONObject, words: List<String>): JSONObject? {
     if (words.isEmpty()) return null
     val els = dump.optJSONArray("els") ?: return null
+    var best: JSONObject? = null
+    var bestScore = Int.MIN_VALUE
     for (k in 0 until els.length()) {
       val e = els.optJSONObject(k) ?: continue
       // Both, joined. On the row we keep failing to find, the title TextView
@@ -1596,16 +1652,167 @@ class ChakaLive(
       if (label.isBlank()) continue
       val l = label.lowercase()
       if (words.all { l.contains(it) }) {
-        return JSONObject()
-          .put("index", e.optInt("i"))
-          .put("label", label)
-          .put("clickable", e.optBoolean("clickable", false))
-          .apply {
-            if (e.optBoolean("toggle")) put("switch_says", if (e.optBoolean("on")) "ON" else "OFF")
-          }
+        // A Settings row and its control can now share the same label. Prefer
+        // the control so a state answer and a requested toggle use the exact
+        // switch bounds, never the row that opens a different page.
+        val score = (if (e.optBoolean("toggle")) 100 else 0) +
+          (if (e.optBoolean("clickable")) 10 else 0)
+        if (score > bestScore) {
+          bestScore = score
+          best = JSONObject()
+            .put("index", e.optInt("i"))
+            .put("label", label)
+            .put("clickable", e.optBoolean("clickable", false))
+            .apply {
+              if (e.optBoolean("toggle")) put("switch_says", if (e.optBoolean("on")) "ON" else "OFF")
+            }
+        }
       }
     }
-    return null
+    return best
+  }
+
+  private fun clearSwitchProof() {
+    lastSwitchProofLabel = ""
+    lastSwitchProofState = ""
+    lastSwitchProofRequest = ""
+    lastSwitchProofAt = 0L
+    clearTargetLock()
+  }
+
+  private fun clearTargetLock() {
+    lockedTarget = ""
+    lockedTargetRequest = ""
+    lockedTargetAt = 0L
+    lockedTargetHasSwitch = false
+  }
+
+  private fun lockTarget(target: String, hasSwitch: Boolean) {
+    lockedTarget = target
+    lockedTargetRequest = currentRequest
+    lockedTargetAt = System.currentTimeMillis()
+    lockedTargetHasSwitch = hasSwitch
+    Log.i(TAG, "target lock: '$target' switch=$hasSwitch for '${currentRequest.take(80)}'")
+  }
+
+  private fun hasTargetLock(): Boolean =
+    lockedTarget.isNotBlank() && lockedTargetRequest == currentRequest
+
+  private fun sameTarget(a: String, b: String): Boolean =
+    a.lowercase().replace(Regex("[^a-z0-9]+"), "") ==
+      b.lowercase().replace(Regex("[^a-z0-9]+"), "")
+
+  /** Extracts a named setting from ordinary state-check language. */
+  private fun settingStateTarget(request: String): String? {
+    val patterns = listOf(
+      Regex("(?:check\\s+(?:if|whether)|whether)\\s+(.+?)\\s+(?:is|are)\\s+(?:on|off|enabled|disabled)\\b", RegexOption.IGNORE_CASE),
+      Regex("(?:is|are)\\s+(.+?)\\s+(?:on|off|enabled|disabled)\\b", RegexOption.IGNORE_CASE)
+    )
+    val raw = patterns.firstNotNullOfOrNull { it.find(request)?.groupValues?.getOrNull(1) } ?: return null
+    val target = raw.trim().replace(Regex("^(?:the\\s+)?", RegexOption.IGNORE_CASE), "")
+    return target.takeIf { it.split(Regex("\\s+")).any { word -> word.length > 2 } }
+  }
+
+  private fun targetLockedResponse(action: String): JSONObject = JSONObject()
+    .put("ok", false)
+    .put("target_locked", lockedTarget)
+    .put(
+      "error",
+      "\"$lockedTarget\" has already been found exactly. $action is blocked because it could move past or act beside the target."
+    )
+    .put(
+      "do_now",
+      if (lockedTargetHasSwitch)
+        "Read the proven switch_is result, call set_found_switch only if the user asked to change it, then finish."
+      else
+        "Call open_found_target. It opens this exact row natively; do not tap by coordinates or scroll again."
+    )
+
+  private fun isWirelessDebuggingStateCheck(request: String): Boolean {
+    val normalized = request.lowercase().replace(Regex("[^a-z0-9]+"), "")
+    return normalized.contains("wirelessdebugging") &&
+      (needsSwitchProof(request) || request.lowercase().contains("check"))
+  }
+
+  /**
+   * Starts the native finite workflow before the model has a chance to choose a
+   * swipe. It is deliberately narrow: known system setting, exact state check,
+   * direct Android entry point, bounded one-way selector scan, native readback.
+   */
+  private fun startNativeWirelessDebuggingCheck(): Boolean {
+    if (!isWirelessDebuggingStateCheck(currentRequest) || nativeSettingsController) return false
+    nativeSettingsController = true
+    Thread {
+      val raw = runCatching { service.checkWirelessDebuggingState() }.getOrElse { error ->
+        JSONObject().put("ok", false).put("error", error.message ?: "Native Settings check failed.").toString()
+      }
+      val result = runCatching { JSONObject(raw) }.getOrElse {
+        JSONObject().put("ok", false).put("error", "Native Settings check returned an unreadable result.")
+      }
+      val state = result.optString("switch_is")
+      nativeSettingsController = false
+      pendingLook = true
+      socket?.let { ws ->
+        if (result.optBoolean("ok") && state in setOf("ON", "OFF")) {
+          recordSwitchProof("Wireless debugging", state)
+          sendText(
+            ws,
+            "[SYSTEM] Native Settings controller completed the user's exact request. Wireless debugging is $state " +
+              "(read directly from Android's checked switch). Do NOT scroll, tap, or search further. Tell the user " +
+              "the result, then call task_done."
+          )
+        } else {
+          taskActive = false
+          sendText(
+            ws,
+            "[SYSTEM] Native Settings controller stopped safely: ${result.optString("error", "Wireless debugging could not be verified.")} " +
+              "Do NOT scroll or guess. Tell the user exactly that it could not be verified."
+          )
+        }
+      }
+    }.also { it.isDaemon = true; it.start() }
+    return true
+  }
+
+  private fun recordSwitchProof(label: String, state: String) {
+    if (label.isBlank() || state !in setOf("ON", "OFF")) return
+    lastSwitchProofLabel = label
+    lastSwitchProofState = state
+    lastSwitchProofRequest = currentRequest
+    lastSwitchProofAt = System.currentTimeMillis()
+    Log.i(TAG, "switch proof: '$label' is $state for '${currentRequest.take(80)}'")
+  }
+
+  /** Settings requests must end with a native state reading for the named control. */
+  private fun needsSwitchProof(request: String): Boolean {
+    val r = request.lowercase()
+    // "Check my email" must not demand an Android switch proof. Only a phrase
+    // that actually asks for or changes an ON/OFF state gets this strict gate.
+    return listOf(
+      "enabled", "disabled", "turned on", "turned off", "turn on", "turn off",
+      "enable", "disable", "switch on", "switch off"
+    ).any { r.contains(it) } ||
+      Regex("\\b(is|are)\\b.*\\b(on|off)\\b").containsMatchIn(r)
+  }
+
+  private fun hasSwitchProofForCurrentRequest(): Boolean {
+    if (lastSwitchProofState.isBlank() || lastSwitchProofRequest != currentRequest) return false
+    // A stale reading from earlier in a long conversation is not proof of the
+    // setting after the current task's actions.
+    if (System.currentTimeMillis() - lastSwitchProofAt > 120_000L) return false
+    val stop = setOf(
+      "check", "whether", "turned", "turn", "enable", "disable", "enabled", "disabled",
+      "switch", "setting", "settings", "please", "would", "could", "with", "that", "this",
+      "what", "tell", "about", "status", "state", "the", "and", "for", "are", "was", "is",
+      "on", "off"
+    )
+    val terms = currentRequest.lowercase().split(Regex("[^a-z0-9]+"))
+      .filter { it.length > 2 && it !in stop }
+    // Wi-Fi is the important edge case here: "wifi" in the request and
+    // "Wi-Fi" on Android must be the same target, not an empty target that
+    // accidentally accepts evidence from some unrelated switch.
+    val proof = lastSwitchProofLabel.lowercase().replace(Regex("[^a-z0-9]+"), "")
+    return terms.isEmpty() || terms.any { proof.contains(it) }
   }
 
   private fun alreadyOnScreen(dump: JSONObject, expect: String): JSONObject? {
@@ -2095,6 +2302,16 @@ class ChakaLive(
             "and wait for their next instruction."
         )
     }
+
+    if (nativeSettingsController) {
+      return JSONObject()
+        .put("ok", false)
+        .put("native_settings_controller", true)
+        .put(
+          "error",
+          "Android is performing the exact Wireless debugging check now. Do not issue any model-driven action or scroll."
+        )
+    }
     val dump = runCatching { JSONObject(service.dumpScreen()) }.getOrNull()
       ?: return JSONObject().put("error", "couldn't read the screen")
 
@@ -2105,6 +2322,38 @@ class ChakaLive(
     // she is about to act on something she has not been shown, which is exactly
     // the blind tap we are trying to make impossible.
     if (name in TOUCHES_THE_PHONE) ensureSeen(dump)
+
+    // Finding a target is a state transition, not a hint for the model to
+    // maybe remember. Once found, only native exact-target operations may
+    // follow. This prevents the observed down-to-the-end, up-to-the-top loop.
+    if (hasTargetLock()) {
+      val sameLockedSearch = name == "scroll_to" && sameTarget(args.optString("target"), lockedTarget)
+      val allowed = name in setOf("read_screen", "look_at_screen", "task_done", "open_found_target", "set_found_switch") ||
+        sameLockedSearch
+      if (!allowed) {
+        pendingLook = true
+        return targetLockedResponse(name).put("screen_now", screenBrief(dump))
+      }
+    }
+
+    // A named setting-state request must start with the deterministic locator,
+    // never with vision-guided swipes. Without this gate the model can ignore
+    // scroll_to altogether and recreate the same search loop by hand.
+    if (name == "swipe") {
+      settingStateTarget(currentRequest)?.let { target ->
+        pendingLook = true
+        return JSONObject()
+          .put("ok", false)
+          .put("manual_search_blocked", true)
+          .put("target", target)
+          .put(
+            "error",
+            "This is a named setting-state check. Manual swiping is blocked because it can pass the target without proving its state."
+          )
+          .put("do_now", "Call scroll_to with target \"$target\". It will lock the exact row or switch and return native proof.")
+          .put("screen_now", screenBrief(dump))
+      }
+    }
 
     // Only DOING something ends a hunt. Looking does not.
     //
@@ -2218,10 +2467,14 @@ class ChakaLive(
             val fresh = runCatching { JSONObject(service.dumpScreen()) }.getOrNull()
             val nowOn = fresh?.optJSONArray("els")?.let { els ->
               (0 until els.length()).map { els.optJSONObject(it) }
-                .firstOrNull { e -> e != null && e.optString("text", e.optString("desc", "")) == label }
+                .firstOrNull { e ->
+                  e != null && e.optBoolean("toggle") &&
+                    e.optString("text", e.optString("desc", "")) == label
+                }
                 ?.optBoolean("on", false)
             }
             if (nowOn != null) {
+              recordSwitchProof(label, if (nowOn) "ON" else "OFF")
               return JSONObject()
                 .put("ok", true)
                 .put("tapped", label)
@@ -2404,6 +2657,71 @@ class ChakaLive(
           res
         }
       }
+      "open_found_target" -> {
+        if (!hasTargetLock()) {
+          return JSONObject()
+            .put("ok", false)
+            .put("error", "There is no currently locked target. Call scroll_to first; never guess a row to open.")
+        }
+        val target = lockedTarget
+        val raw = runCatching { service.openByText(target) }.getOrNull()
+          ?: return JSONObject()
+            .put("ok", false)
+            .put("target_locked", target)
+            .put("error", "The locked target could not be opened natively. Do not fall back to a guessed tap.")
+        val res = JSONObject(raw).put("target_locked", target)
+        if (!res.optBoolean("ok")) {
+          pendingLook = true
+          return res.put("screen_now", screenBrief(dump))
+        }
+        // The page is changing, so reset the old scroll hunt. A state check
+        // keeps its lock until the detail-page switch is read; an ordinary
+        // navigation target is now complete and may continue with its plan.
+        huntFor = ""; huntSwipes = 0; huntReversals = 0; huntDir = ""
+        val isStateTarget = settingStateTarget(currentRequest)?.let { sameTarget(it, target) } == true
+        if (!isStateTarget) clearTargetLock()
+        withOutcome(dump, "open_found_target:$target", res)
+      }
+      "set_found_switch" -> {
+        if (!hasTargetLock()) {
+          return JSONObject()
+            .put("ok", false)
+            .put("error", "There is no currently locked switch. Call scroll_to first; never toggle by a guessed position.")
+        }
+        if (!lockedTargetHasSwitch) {
+          return JSONObject()
+            .put("ok", false)
+            .put("target_locked", lockedTarget)
+            .put("error", "The locked target is a row, not a readable switch. Call open_found_target first.")
+        }
+        val target = lockedTarget
+        val desired = args.optBoolean("enabled")
+        val raw = runCatching { service.setSwitchByText(target, desired) }.getOrNull()
+          ?: return JSONObject()
+            .put("ok", false)
+            .put("target_locked", target)
+            .put("error", "The exact switch could not be read back after the request. Its state is unknown; do not claim it changed.")
+        val res = JSONObject(raw).put("target_locked", target)
+        if (res.optBoolean("verified", false)) {
+          val state = res.optString("switch_is")
+          recordSwitchProof(target, state)
+          lockedTargetHasSwitch = true
+        }
+        if (!res.optBoolean("ok")) {
+          pendingLook = true
+          return res.put("screen_now", screenBrief(dump))
+        }
+        // The exact requested state is now proven, so a longer multi-step task
+        // is free to continue instead of being pinned to a completed switch.
+        clearTargetLock()
+        // No screen change is normal when the switch was already in the desired
+        // state; it is still a successful, freshly verified outcome.
+        if (!res.optBoolean("changed", false)) {
+          pendingLook = true
+          return res.put("screen_now", screenBrief(dump))
+        }
+        withOutcome(dump, "set_found_switch:$target", res)
+      }
       // Searching by name is a solved problem the moment the phone does the
       // looking. She scrolled past Wireless debugging over and over, up and
       // down, having ALREADY read it out correctly minutes earlier — so this is
@@ -2454,22 +2772,25 @@ class ChakaLive(
         var atEnd = false
         val seenAll = LinkedHashSet<String>()
         while (steps <= 25) {
-          // Ask Android, not our own flattened copy of the tree. This is the
-          // whole fix: findAccessibilityNodeInfosByText searches text and
-          // content-description across the live window, without the
-          // isVisibleToUser filter, 400-node cap and depth limit that were
-          // losing this row while it sat plainly on screen.
+          // Ask Android's live window trees, not our own flattened copy. This
+          // bypasses payload caps and Samsung's unreliable visible flag that
+          // were losing this row while it sat plainly on screen.
           val native = runCatching { service.findByText(target) }.getOrNull()
+          Log.i(TAG, "scroll_to step $steps: els=${here.optJSONArray("els")?.length() ?: 0} " +
+            "findByText=${native ?: "null"}")
           if (native != null) {
             val n = JSONObject(native)
             Log.i(TAG, "scroll_to '$target' -> FOUND natively after $steps steps: $native")
             pendingLook = true
             huntFor = ""; huntSwipes = 0; huntReversals = 0; huntDir = ""
+            lockTarget(target, n.has("switch_is"))
             val res = JSONObject()
               .put("ok", true)
               .put("found", n.optString("label"))
+              .put("target_locked", target)
               .put("steps_scrolled", steps)
             if (n.has("switch_is")) {
+              recordSwitchProof(n.optString("label"), n.optString("switch_is"))
               res.put("switch_is", n.optString("switch_is"))
                 .put(
                   "answer",
@@ -2478,26 +2799,69 @@ class ChakaLive(
                 )
                 .put(
                   "to_change_it",
-                  "Tap the SWITCH at x=${n.optInt("switch_cx")} y=${n.optInt("switch_cy")} with tap_at (they are " +
-                    "pixels, not fractions). Tapping the row's words instead opens that setting's own page."
+                  "The target is locked. Call set_found_switch only if the user asked to change it; it uses this exact " +
+                    "native switch and reads the state back. Do not tap or scroll by hand."
                 )
             } else {
-              res.put("to_open_it", "Tap it with tap_at at x=${n.optInt("row_cx", n.optInt("cx"))} y=${n.optInt("row_cy", n.optInt("cy"))} (pixels).")
+              res.put("to_open_it", "The exact row is locked. Call open_found_target; it opens this native row without guessed coordinates.")
             }
             return res.put("screen_now", screenBrief(here))
+          }
+
+          // PIXELS, when the tree has nothing. The tree is a curated copy of
+          // the screen and rows can be missing from it while plainly drawn —
+          // "Wireless debugging" is exactly that, and no flag, window or
+          // platform search call reaches it. OCR reads what is actually on the
+          // glass, and hands back a real box instead of an estimate, so this
+          // fixes finding AND aiming in one move.
+          runCatching { service.findByPixels(target) }.getOrNull()?.let { raw ->
+            val o = JSONObject(raw)
+            if (o.optBoolean("found")) {
+              Log.i(TAG, "scroll_to '$target' -> FOUND BY OCR after $steps steps: ${raw.take(200)}")
+              pendingLook = true
+              huntFor = ""; huntSwipes = 0; huntReversals = 0; huntDir = ""
+              // The switch belongs to the row, so it sits on the same line at
+              // the right-hand edge. Tapping the words opens the setting's own
+              // page; tapping the switch toggles it.
+              val w = dump.optInt("w", 720)
+              return JSONObject()
+                .put("ok", true)
+                .put("found", o.optString("text"))
+                .put("read_from", "the screen itself (OCR), not the element list")
+                .put("steps_scrolled", steps)
+                .put("tap_the_row_at", "${o.optInt("cx")},${o.optInt("cy")}")
+                .put("tap_the_switch_at", "${(w * 0.87).toInt()},${o.optInt("cy")}")
+                .put(
+                  "do_now",
+                  "It is on screen NOW. These are PIXELS, not fractions — pass them to tap_at exactly as given. " +
+                    "To turn something on or off use tap_the_switch_at; to open its page use tap_the_row_at. " +
+                    "Say out loud what you can see about it before you act."
+                )
+                .put("screen_now", screenBrief(here))
+            }
           }
 
           findOnScreen(here, words)?.let { found ->
             Log.i(TAG, "scroll_to '$target' -> found in tree at [${found.optInt("index")}] after $steps steps")
             pendingLook = true
             huntFor = ""; huntSwipes = 0; huntReversals = 0; huntDir = ""
+            val switchState = found.optString("switch_says")
+            lockTarget(target, switchState.isNotBlank())
+            if (switchState.isNotBlank()) recordSwitchProof(found.optString("label"), switchState)
             return JSONObject()
               .put("ok", true)
               .put("found", found.optString("label"))
+              .put("target_locked", target)
               .put("index", found.optInt("index"))
               .put("steps_scrolled", steps)
-              .apply { found.optString("switch_says").takeIf { it.isNotBlank() }?.let { put("switch_is", it) } }
-              .put("do_now", "It is on screen NOW. Say what you can see about it, then act on it — tap_index ${found.optInt("index")}.")
+              .apply { switchState.takeIf { it.isNotBlank() }?.let { put("switch_is", it) } }
+              .put(
+                "do_now",
+                if (switchState.isNotBlank())
+                  "The target is locked and its native state is proven. Report it, or call set_found_switch if the user asked to change it."
+                else
+                  "The target is locked. Call open_found_target; do not tap by index or scroll again."
+              )
               .put("screen_now", screenBrief(here))
           }
 
@@ -2517,10 +2881,9 @@ class ChakaLive(
           }
           // And say outright whether the platform search can see it from here,
           // separately from whether our own copy of the tree can.
-          if (steps == 0) {
-            Log.i(TAG, "scroll_to probe: els=${here.optJSONArray("els")?.length() ?: 0} " +
-              "findByText=${runCatching { service.findByText(target) }.getOrNull() ?: "null"}")
-          }
+          // EVERY step, not just the first. The step-0-only version only ever
+          // reported the screen she happened to start on — usually Settings
+          // root, where the row genuinely is not — so it proved nothing at all.
           val before = contentSig(here)
           // The list's own scroll action first — but TRUST NOTHING IT SAYS.
           // performAction returns true off a scrollable that is not the list in
@@ -2745,6 +3108,29 @@ class ChakaLive(
       "task_done" -> {
         val summary = args.optString("summary")
 
+        // A language-model assertion is never evidence of a setting's state.
+        // This blocks the exact failure where Chaka twice said "wireless
+        // debugging is on" after scrolling past the row. scroll_to and a
+        // verified toggle both record the reading directly from isChecked.
+        if (needsSwitchProof(currentRequest) && !hasSwitchProofForCurrentRequest()) {
+          awaitingDoneProof = false
+          pendingLook = true
+          return JSONObject()
+            .put("ok", false)
+            .put("refused", true)
+            .put("the_request", currentRequest)
+            .put(
+              "error",
+              "You cannot report this setting's state yet. There is no fresh native ON/OFF reading for the setting " +
+                "named in the request. A picture follows, but do not infer state from it or from memory."
+            )
+            .put(
+              "do_now",
+              "Call scroll_to with the setting's exact on-screen name. It will stop at that row and return switch_is " +
+                "from the actual Android control. Only then tell the user the result."
+            )
+        }
+
         // Nothing has actually changed on screen for several actions. She
         // dragged the same icon fourteen times, moved nothing, and declared
         // success twice. A claim cannot outrank the record.
@@ -2823,6 +3209,7 @@ class ChakaLive(
         taskActive = false
         drives = 0
         autoContinues = 0
+        clearTargetLock()
         plan.clear(); planStep = 0; planGoal = ""
         Log.i(TAG, "task_done: ${args.optString("summary")}")
         ChakaGuideOverlay.update("✓ ${args.optString("summary").take(140)}")

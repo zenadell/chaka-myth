@@ -22,4 +22,10 @@ dependencies {
   // thread freezes once Chaka is backgrounded, which is exactly when Live Mode
   // is doing its job).
   implementation 'com.squareup.okhttp3:okhttp:4.12.0'
+  // On-device OCR. This is what lets her find things the accessibility tree
+  // refuses to show her — the tree is a curated copy of the screen and apps can
+  // hide rows from it, but nothing can hide a row from the pixels it draws.
+  // Fully offline, free, ~4MB, real-time for Latin script, and it returns exact
+  // bounding boxes in image pixels rather than an estimate.
+  implementation 'com.google.mlkit:text-recognition:16.0.1'
 }
