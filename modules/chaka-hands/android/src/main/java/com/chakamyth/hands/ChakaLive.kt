@@ -2444,10 +2444,46 @@ class ChakaLive(
           val wasOn = hit.optBoolean("on", false)
           // Changing a setting nobody asked about is never part of a task. She
           // was asked to move an icon and turned Bluetooth on.
-          if (isToggle && currentRequest.isNotEmpty()) {
-            val req = currentRequest.lowercase()
-            val words = label.lowercase().split(Regex("[^a-z0-9]+")).filter { it.length > 3 }
-            if (words.isNotEmpty() && words.none { req.contains(it) }) {
+          if (isToggle && label.isNotBlank()) {
+            // Everything she has been told recently, not just the last sentence.
+            // currentRequest gets overwritten by asides — it read "Just calm
+            // down, I will tell you what's next" at the moment she switched
+            // Wi-Fi off — so a guard consulting only that has nothing to work
+            // with when it matters most.
+            val req = (currentRequest + " " + synchronized(recentSpeech) { recentSpeech.toString() }).lowercase()
+            val name = label.lowercase().trim()
+            // NO LENGTH FILTER. The old one kept only tokens longer than three
+            // characters, so "Wi-Fi" became ["wi","fi"], both dropped, the list
+            // came back empty and the guard skipped itself entirely. It was
+            // blind to precisely the toggles that break a phone: Wi-Fi, NFC,
+            // GPS, VPN. She turned Wi-Fi off mid-task and killed her own
+            // connection, and nothing objected.
+            val tokens = name.split(Regex("[^a-z0-9]+")).filter { it.isNotBlank() }
+            val mentioned = req.contains(name) || (tokens.isNotEmpty() && tokens.all { req.contains(it) })
+
+            // MENTIONING A SETTING IS NOT PERMISSION TO CHANGE IT. "Check if
+            // Wi-Fi is on" names Wi-Fi and asks for nothing to be touched. The
+            // verb has to belong to THIS control, so it must appear just before
+            // the name — "turn on Bluetooth" authorises Bluetooth and nothing
+            // else in the same sentence.
+            val verbs = "turn on|turn off|turn|enable|disable|switch on|switch off|toggle|activate|deactivate|put on|put off|set"
+            val askedToChangeThis = Regex("($verbs)\\W+(\\w+\\W+){0,2}?" + Regex.escape(name)).containsMatchIn(req) ||
+              Regex("($verbs)\\W+(\\w+\\W+){0,2}?" + Regex.escape(tokens.firstOrNull() ?: name)).containsMatchIn(req)
+
+            if (mentioned && !askedToChangeThis) {
+              Log.w(TAG, "refusing to toggle \"$label\" — mentioned, but never asked to be changed")
+              return JSONObject()
+                .put("ok", false)
+                .put("off_task", true)
+                .put("the_request", currentRequest)
+                .put(
+                  "error",
+                  "\"$label\" was mentioned, but nobody asked you to change it. Reading whether it is on is not " +
+                    "permission to turn it off."
+                )
+                .put("do_now", "Leave it exactly as it is. Report its state if that is what was asked, and move on.")
+            }
+            if (!mentioned) {
               Log.w(TAG, "refusing to toggle \"$label\" — not part of \"$currentRequest\"")
               return JSONObject()
                 .put("ok", false)
