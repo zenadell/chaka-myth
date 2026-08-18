@@ -162,6 +162,21 @@ class ChakaLive(
   // (screen, action) pair is new and nothing ever repeats. Meanwhile she can
   // scroll past the target over and over — 28 times, measured, with the row in
   // the middle of the screen the whole while.
+  // The last thing a search actually located, in real screen pixels. She was
+  // handed "164,1429" and tapped x=0.869 y=0.992 — a fraction, at the very
+  // bottom edge of the screen, 158px below the row OCR had measured for her.
+  // Asking a model to transcribe coordinates it was just given is a step that
+  // can fail, so it is removed: tap_found uses these directly.
+  // How many times the SAME target has been located with nothing done about it
+  // in between. There was a guard for searching and failing, and none for
+  // searching and succeeding — so she found "USB debugging" roughly forty times
+  // in forty seconds, each one a round trip, and never once acted on it.
+  @Volatile private var foundRepeats = 0
+  @Volatile private var foundLabel = ""
+  @Volatile private var foundRowX = -1
+  @Volatile private var foundRowY = -1
+  @Volatile private var foundSwitchX = -1
+  @Volatile private var foundSwitchY = -1
   @Volatile private var huntFor = ""
   @Volatile private var huntSwipes = 0
   // Direction, and how often she has changed her mind about it. Raw swipe count
@@ -618,6 +633,12 @@ class ChakaLive(
         "Set the switch currently locked by scroll_to, then read its real Android state back. Use only when the user explicitly asked to turn that setting on or off.",
         props("enabled", "boolean", "true = ON, false = OFF"),
         listOf("enabled")
+      ))
+      .put(fn(
+        "tap_found",
+        "Tap the thing scroll_to just located — no coordinates needed, and none can be got wrong. part:\"switch\" toggles it on or off; part:\"row\" opens that setting's own page. ALWAYS use this after a successful scroll_to instead of tap_at: the phone already measured exactly where it is, down to the pixel.",
+        props("part", "string", "switch or row"),
+        listOf("part")
       ))
       .put(fn("press_button", "Press a system button: back, home, recents, notifications, quick_settings.", props("button", "string", "back|home|recents|notifications|quick_settings"), listOf("button")))
       .put(fn("open_app", "Launch an app by name.", props("app", "string", "App name, e.g. spotify"), listOf("app")))
@@ -1995,6 +2016,12 @@ class ChakaLive(
    * carries the app she landed in, whether the screen moved, and a repeat
    * warning, so a wrong move is self-evident on the very next step.
    */
+  /** Same thing, roughly — enough to notice she is re-finding what she has. */
+  private fun sameTargetish(a: String, b: String): Boolean {
+    val x = a.lowercase().trim(); val y = b.lowercase().trim()
+    return x == y || y.contains(x) || x.contains(y)
+  }
+
   private fun planText(): String {
     if (plan.isEmpty()) return "(no plan set — call set_plan if this needs more than one step)"
     return "GOAL: $planGoal\n" + plan.mapIndexed { i, st ->
@@ -2367,6 +2394,8 @@ class ChakaLive(
     // scroll_to has to be excluded too, or it resets the very counter it sets a
     // few lines later and can never reach its own limit. That is exactly what
     // happened: fifteen identical searches, guard never fired once.
+    // Doing something with what she found clears the "stop re-finding it" state.
+    if (name in TOUCHES_THE_PHONE && name != "scroll_to") { foundRepeats = 0 }
     if (name in TOUCHES_THE_PHONE && name != "swipe" && name != "scroll_to") {
       huntFor = ""; huntSwipes = 0; huntReversals = 0; huntDir = ""
     }
@@ -2766,10 +2795,48 @@ class ChakaLive(
       // now?" is a question she has to re-answer after every swipe, from a
       // picture that has already faded, while she fires the next swipe. The
       // element tree answers it exactly, every time, for free.
+      "tap_found" -> {
+        if (foundLabel.isBlank() || foundRowY < 0) {
+          return JSONObject().put("ok", false)
+            .put("error", "Nothing has been located yet. Call scroll_to first, then tap_found.")
+        }
+        val wantSwitch = args.optString("part", "row").startsWith("s")
+        val x = if (wantSwitch && foundSwitchX >= 0) foundSwitchX else foundRowX
+        val y = if (wantSwitch && foundSwitchY >= 0) foundSwitchY else foundRowY
+        Log.i(TAG, "tap_found ${if (wantSwitch) "switch" else "row"} of '$foundLabel' at $x,$y")
+        service.tap(x, y)
+        withOutcome(
+          dump, "tap_found:${if (wantSwitch) "switch" else "row"}:$foundLabel",
+          JSONObject().put("ok", true).put("tapped", foundLabel).put("at", "$x,$y")
+        )
+      }
       "scroll_to" -> {
         val target = args.optString("target").trim()
         // Same guard as swiping, for the same reason: she called this fifteen
         // times for one target, alternating direction, once it started failing.
+        // Already found, nothing done since. Searching again cannot help.
+        if (foundLabel.isNotBlank() && sameTargetish(target, foundLabel)) {
+          foundRepeats++
+          if (foundRepeats >= 2) {
+            Log.w(TAG, "scroll_to REFUSED — '$target' already located ($foundRepeats), no action taken")
+            pendingLook = true
+            return JSONObject()
+              .put("ok", false)
+              .put("already_found", foundLabel)
+              .put(
+                "error",
+                "You have already found \"$foundLabel\" and have not done anything with it. Searching again finds " +
+                  "the same thing in the same place."
+              )
+              .put(
+                "do_now",
+                "ACT on it now: tap_found(\"switch\") to turn it on or off, or tap_found(\"row\") to open its page. " +
+                  "If it is not the right row, say so out loud and search for the exact words you actually want."
+              )
+          }
+        } else {
+          foundRepeats = 0
+        }
         val hkey = "scrollto:${target.lowercase()}"
         if (hkey == huntFor) huntSwipes++ else { huntFor = hkey; huntSwipes = 1; huntReversals = 0 }
         if (huntSwipes >= 3) {
@@ -2824,9 +2891,13 @@ class ChakaLive(
             pendingLook = true
             huntFor = ""; huntSwipes = 0; huntReversals = 0; huntDir = ""
             lockTarget(target, n.has("switch_is"))
+            foundLabel = n.optString("label")
+            foundRowX = n.optInt("row_cx", n.optInt("cx")); foundRowY = n.optInt("row_cy", n.optInt("cy"))
+            foundSwitchX = n.optInt("switch_cx", -1); foundSwitchY = n.optInt("switch_cy", -1)
             val res = JSONObject()
               .put("ok", true)
               .put("found", n.optString("label"))
+              .put("now_call", "tap_found(\"switch\") to toggle it, or tap_found(\"row\") to open its page")
               .put("target_locked", target)
               .put("steps_scrolled", steps)
             if (n.has("switch_is")) {
@@ -2893,9 +2964,13 @@ class ChakaLive(
               // the right-hand edge. Tapping the words opens the setting's own
               // page; tapping the switch toggles it.
               val w = dump.optInt("w", 720)
+              foundLabel = o.optString("text")
+              foundRowX = o.optInt("cx"); foundRowY = o.optInt("cy")
+              foundSwitchX = (w * 0.87).toInt(); foundSwitchY = o.optInt("cy")
               return JSONObject()
                 .put("ok", true)
                 .put("found", o.optString("text"))
+                .put("now_call", "tap_found(\"switch\") to toggle it, or tap_found(\"row\") to open its page")
                 .put("read_from", "the screen itself (OCR), not the element list")
                 .put("steps_scrolled", steps)
                 .put("tap_the_row_at", "${o.optInt("cx")},${o.optInt("cy")}")

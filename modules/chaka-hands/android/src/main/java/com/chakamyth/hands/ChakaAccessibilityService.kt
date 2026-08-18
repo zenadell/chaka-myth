@@ -216,6 +216,14 @@ class ChakaAccessibilityService : AccessibilityService() {
       // A Settings title and its preference row can have identical text. The
       // row is deterministically better because it is structurally paired with
       // the switch that supplies the requested state.
+      // A containment match that is far longer than what was asked for is
+      // probably a DIFFERENT setting that happens to quote it. "USB debugging"
+      // matched "Revoke USB debugging authorisations" and reported that row's
+      // switch state as the answer — a wrong fact, stated confidently, about a
+      // control the user never mentioned. Penalise the surplus words.
+      if (normalizedLabel != normalizedQuery) {
+        score -= (normalizedLabel.length - normalizedQuery.length).coerceAtLeast(0) * 60
+      }
       if (toggle != null) score += 2_000
       if (row != null) score += 100
       if (node.isVisibleToUser) score += 20
