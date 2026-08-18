@@ -2021,7 +2021,14 @@ class ChakaLive(
   /** Same thing, roughly — enough to notice she is re-finding what she has. */
   private fun sameTargetish(a: String, b: String): Boolean {
     val x = a.lowercase().trim(); val y = b.lowercase().trim()
-    return x == y || y.contains(x) || x.contains(y)
+    if (x == y) return true
+    // Containment alone is far too loose. "Revoke USB debugging
+    // authorisations" contains "USB debugging" and is a different setting —
+    // treating them as the same let a wrong row block every further search for
+    // the right one, 62 times over.
+    val longer = maxOf(x.length, y.length).coerceAtLeast(1)
+    val shorter = minOf(x.length, y.length)
+    return (y.contains(x) || x.contains(y)) && shorter.toDouble() / longer >= 0.75
   }
 
   private fun planText(): String {
@@ -2819,7 +2826,15 @@ class ChakaLive(
         // Already found, nothing done since. Searching again cannot help.
         if (foundLabel.isNotBlank() && sameTargetish(target, foundLabel)) {
           foundRepeats++
-          if (foundRepeats >= 2) {
+          // ALWAYS AN ESCAPE. Refusing forever is worse than the loop it
+          // replaced: the stored find was the WRONG row, so she could neither
+          // act on it nor search past it, and the guard refused 62 times in a
+          // row. A guard that cannot be satisfied is a trap.
+          if (foundRepeats >= 4) {
+            Log.w(TAG, "clearing stale find '$foundLabel' — refused $foundRepeats times, letting her search again")
+            foundLabel = ""; foundRowX = -1; foundRowY = -1
+            foundSwitchX = -1; foundSwitchY = -1; foundRepeats = 0
+          } else if (foundRepeats >= 2) {
             Log.w(TAG, "scroll_to REFUSED — '$target' already located ($foundRepeats), no action taken")
             pendingLook = true
             return JSONObject()
@@ -2902,6 +2917,14 @@ class ChakaLive(
               .put("now_call", "tap_found(\"switch\") to toggle it, or tap_found(\"row\") to open its page")
               .put("target_locked", target)
               .put("steps_scrolled", steps)
+            if (!sameTargetish(target, n.optString("label"))) {
+              res.put(
+                "WARNING_NOT_EXACT",
+                "You asked for \"$target\". The closest thing on screen is \"${n.optString("label")}\", which is a " +
+                  "DIFFERENT setting. Do NOT report its state as the answer to your question. Say what you actually " +
+                  "found, and if the one you want is not on this screen, say so plainly."
+              )
+            }
             if (n.has("switch_is")) {
               recordSwitchProof(n.optString("label"), n.optString("switch_is"))
               res.put("switch_is", n.optString("switch_is"))
