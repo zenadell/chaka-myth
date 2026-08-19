@@ -2,7 +2,7 @@
   "expo": {
     "name": "Chaka-Myth",
     "slug": "chaka-myth",
-    "version": "8.7.0",
+    "version": "8.9.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "dark",

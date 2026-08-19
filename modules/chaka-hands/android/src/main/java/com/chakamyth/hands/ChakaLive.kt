@@ -174,6 +174,11 @@ class ChakaLive(
   // in between. There was a guard for searching and failing, and none for
   // searching and succeeding — so she found "USB debugging" roughly forty times
   // in forty seconds, each one a round trip, and never once acted on it.
+  // Set the moment a search succeeds. A video frame opens no turn, so pushing
+  // the picture alone gave her something to look at and no reason to look — she
+  // found the row and went silent in front of it. This is the prompt that goes
+  // out WITH the picture and forces her to say what she sees and decide.
+  @Volatile private var pendingDecision = ""
   @Volatile private var lastFoundAt = 0L
   @Volatile private var foundRepeats = 0
   @Volatile private var foundLabel = ""
@@ -884,11 +889,22 @@ class ChakaLive(
       // deliberately NOT cleared: the reconciliation prompt still goes at
       // turnComplete, where forcing her to stop and answer is the point.
       if (pendingLook) {
+        val demand = pendingDecision
+        pendingDecision = ""
         Thread {
           Thread.sleep(350)
           if (!cancelled && ready) {
             val d = runCatching { JSONObject(service.dumpScreen()) }.getOrNull()
             sendFrame(ws, force = true, forSig = d?.let { sig(it) } ?: "", marks = d?.optJSONArray("els"))
+            // The picture alone is not enough. Video opens no turn, so without
+            // this she sits looking at the very thing she was told to find and
+            // says nothing — which is exactly what happened in front of the
+            // three debugging rows. Text commits a turn; a turn forces a
+            // decision.
+            if (demand.isNotEmpty()) {
+              Thread.sleep(250)
+              if (!cancelled && ready) sendText(ws, demand)
+            }
           }
         }.also { it.isDaemon = true }.start()
       }
@@ -1386,7 +1402,10 @@ class ChakaLive(
         if (speaking) continue
         // Same bytes, two listeners: Gemini for the conversation, ChakaEars to
         // say whether that was a person or the room.
-        runCatching { ears.feed(buf, n) }
+        // Only while it is actually working. This device answers BUSY to piped
+        // audio every single time, so after it stands down there is no point
+        // copying every buffer into a queue nobody drains.
+        if (ears.available) runCatching { ears.feed(buf, n) }
         val b64 = Base64.encodeToString(buf.copyOf(n), Base64.NO_WRAP)
         try {
           ws.send(
@@ -2583,7 +2602,19 @@ class ChakaLive(
     // follow. This prevents the observed down-to-the-end, up-to-the-top loop.
     if (hasTargetLock()) {
       val sameLockedSearch = name == "scroll_to" && sameTarget(args.optString("target"), lockedTarget)
-      val allowed = name in setOf("read_screen", "look_at_screen", "task_done", "open_found_target", "set_found_switch") ||
+      // MOVING AND LOOKING ARE ALWAYS ALLOWED. The lock exists to stop her
+      // ACTING on the wrong control, not to pin her to one spot. It listed only
+      // reading and acting, so once it engaged she could not swipe at all —
+      // she tried four times, was refused four times, and told the owner "I'm
+      // stuck on the first screen, I can't scroll down". She was right, and it
+      // was this. Locking a target and then forbidding movement is incoherent:
+      // scrolling is how you reach the thing you are locked onto.
+      val navigating = name in setOf(
+        "swipe", "scroll_to", "press_button", "open_app_drawer", "wait",
+        "read_screen", "look_at_screen", "read_clipboard", "task_done", "remember", "recall"
+      )
+      val allowed = navigating ||
+        name in setOf("open_found_target", "set_found_switch", "tap_found") ||
         sameLockedSearch
       if (!allowed) {
         pendingLook = true
@@ -2594,7 +2625,11 @@ class ChakaLive(
     // A named setting-state request must start with the deterministic locator,
     // never with vision-guided swipes. Without this gate the model can ignore
     // scroll_to altogether and recreate the same search loop by hand.
-    if (name == "swipe") {
+    // Only before anything has been located. Once she has found the row, she
+    // may need to scroll to read what is around it — which is precisely what
+    // the owner asked her to do ("tell me which ones are available") and what
+    // this gate made impossible.
+    if (name == "swipe" && foundLabel.isBlank()) {
       settingStateTarget(currentRequest)?.let { target ->
         pendingLook = true
         return JSONObject()
@@ -3129,6 +3164,11 @@ class ChakaLive(
             huntFor = ""; huntSwipes = 0; huntReversals = 0; huntDir = ""
             lockTarget(target, n.has("switch_is"))
             foundLabel = n.optString("label"); lastFoundAt = System.currentTimeMillis()
+            pendingDecision =
+              "[SYSTEM] You have found \"${n.optString("label")}\" and you are looking at that screen RIGHT NOW. " +
+                "Read it. Say out loud what you can see around it. Then DECIDE and do it in this same turn: act with " +
+                "tap_found if it is unambiguous, or ASK which they meant, naming the rows exactly as they appear. Do " +
+                "not go quiet, and do not search for it again — it is in front of you."
             foundRowX = n.optInt("row_cx", n.optInt("cx")); foundRowY = n.optInt("row_cy", n.optInt("cy"))
             foundSwitchX = n.optInt("switch_cx", -1); foundSwitchY = n.optInt("switch_cy", -1)
             val res = JSONObject()
@@ -3210,6 +3250,12 @@ class ChakaLive(
               // page; tapping the switch toggles it.
               val w = dump.optInt("w", 720)
               foundLabel = o.optString("text"); lastFoundAt = System.currentTimeMillis()
+              pendingDecision =
+                "[SYSTEM] You have found \"${o.optString("text")}\" and you are looking at that screen RIGHT NOW. " +
+                  "Read it. Say out loud what you can see around it — the other rows near it, and whether each is on " +
+                  "or off. Then DECIDE and do it in this same turn: if it is unambiguous, act with tap_found. If " +
+                  "several things there could be what they meant, ASK them which, naming the rows exactly as they " +
+                  "appear on screen. Do not go quiet, and do not search for it again — it is in front of you."
               foundRowX = o.optInt("cx"); foundRowY = o.optInt("cy")
               foundSwitchX = (w * 0.87).toInt(); foundSwitchY = o.optInt("cy")
               return JSONObject()

@@ -134,8 +134,8 @@ class ChakaEars(private val context: Context) {
           if (errors <= 3 || errors % 20 == 0) Log.w(TAG, "recogniser error: $name (x$errors)")
           // Repeated hard errors mean this device will not do piped audio.
           // Stand down rather than spin, and let the transcript check take over.
-          if (errors >= 25) {
-            Log.e(TAG, "giving up on the second ears after $errors errors — transcript checking only")
+          if (errors >= 4) {
+            Log.e(TAG, "piped audio refused by this device ($errors errors) — second ears off, transcript checking only")
             available = false
             return
           }
