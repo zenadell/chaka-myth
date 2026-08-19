@@ -1011,6 +1011,7 @@ class ChakaLive(
               plan.clear(); planStep = 0; planGoal = ""
               stateActionCount.clear(); triedFromState.clear(); stateVisits.clear()
               noProgressRun = 0
+              refusals.clear()
               Log.i(TAG, "NEW REQUEST: \"$heard\"")
             }
           }
@@ -1685,7 +1686,7 @@ class ChakaLive(
     val words = t.split(Regex("[^a-z0-9]+")).filter { it.length > 2 }
     if (words.isEmpty() || words.any { scope.contains(it) }) return null
     Log.w(TAG, "OFF-PLAN blocked: '$target' — scope was \"${scope.take(120)}\"")
-    return JSONObject()
+    return refusing("offplan:$t", JSONObject()
       .put("ok", false)
       .put("off_plan", true)
       .put(
@@ -1699,7 +1700,7 @@ class ChakaLive(
         "Go back to the plan above. If you are stuck on the current step, say so OUT LOUD - what you tried and what " +
           "is blocking you - and ask the user how to proceed. Being stuck is something to report, never a reason to " +
           "wander off into another app."
-      )
+      ))
   }
 
   /**
@@ -2108,15 +2109,17 @@ class ChakaLive(
 
     if (!mentioned) {
       Log.w(TAG, "BLOCKED change to \"$label\" — never mentioned in \"$currentRequest\"")
-      return JSONObject().put("ok", false).put("off_task", true).put("the_request", currentRequest)
+      return refusing("change:$name", JSONObject().put("ok", false).put("off_task", true)
+        .put("the_request", currentRequest)
         .put("error", "\"$label\" is not part of what was asked. Do not change settings nobody mentioned.")
-        .put("do_now", "Leave it alone and go back to the actual request.")
+        .put("do_now", "Leave it alone and go back to the actual request."))
     }
     if (!askedToChangeThis) {
       Log.w(TAG, "BLOCKED change to \"$label\" — mentioned, but not asked to change")
-      return JSONObject().put("ok", false).put("off_task", true).put("the_request", currentRequest)
+      return refusing("change:$name", JSONObject().put("ok", false).put("off_task", true)
+        .put("the_request", currentRequest)
         .put("error", "\"$label\" was mentioned, but nobody asked you to CHANGE it. Reading it is not permission to touch it.")
-        .put("do_now", "Leave it exactly as it is. Report its state if that was the question, and move on.")
+        .put("do_now", "Leave it exactly as it is. Report its state if that was the question, and move on."))
     }
     return null
   }
@@ -2193,6 +2196,57 @@ class ChakaLive(
     // At least a fifth of it should be everyday English, or it is not a sentence
     // said to her — it is something the microphone happened to pick up.
     return hits.toDouble() / words.size >= 0.20
+  }
+
+  // Every refusal ever handed back, by what it was refusing.
+  private val refusals = HashMap<String, Int>()
+
+  /**
+   * A refusal that cannot repeat forever.
+   *
+   * Eight guards in this file have failed the same way: they say "no" clearly
+   * and say nothing about what to do INSTEAD, so she tries the same thing
+   * again, gets the same "no", and the pair of us loop at one call a second.
+   * The block on "Revoke USB debugging authorisations" was correct twice over
+   * and still produced a loop, because being right about the refusal is not the
+   * same as leaving her somewhere to go.
+   *
+   * So refusing is now a countable event. The first two carry a warning; the
+   * third stops the task and hands it back to the owner with the real options
+   * named. Any guard that routes through here is incapable of trapping her.
+   */
+  private fun refusing(key: String, body: JSONObject, dump: JSONObject? = null): JSONObject {
+    val n = (refusals[key] ?: 0) + 1
+    refusals[key] = n
+    if (n >= 3) {
+      refusals.remove(key)
+      taskActive = false
+      pendingLook = true
+      Log.w(TAG, "REFUSAL ESCALATED after $n attempts at '$key' — stopping and asking the user")
+      return JSONObject()
+        .put("ok", false)
+        .put("stop", true)
+        .put("refused_times", n)
+        .put(
+          "error",
+          "You have been refused this same thing $n times. Trying it again will be refused again. This is not " +
+            "something to work around."
+        )
+        .put(
+          "do_now",
+          "STOP and TALK TO THEM. Say out loud, in plain words: what you were trying to do, why you cannot, and " +
+            "what you can actually see on screen. Then ask them which they meant, naming the real options in their " +
+            "exact on-screen words. Do not act again until they answer."
+        )
+        .apply { dump?.let { put("screen_now", screenBrief(it)) } }
+    }
+    return body
+      .put("attempt", n)
+      .put(
+        "instead_of_repeating",
+        "Do NOT try this again — it will be refused again. Do the thing suggested above, or if you cannot, say out " +
+          "loud what is blocking you and ask. One more identical attempt and the task stops."
+      )
   }
 
   private fun planText(): String {
@@ -3003,7 +3057,7 @@ class ChakaLive(
           } else if (foundRepeats >= 2) {
             Log.w(TAG, "scroll_to REFUSED — '$target' already located ($foundRepeats), no action taken")
             pendingLook = true
-            return JSONObject()
+            return refusing("refind:${target.lowercase()}", JSONObject()
               .put("ok", false)
               .put("already_found", foundLabel)
               .put(
@@ -3015,7 +3069,7 @@ class ChakaLive(
                 "do_now",
                 "ACT on it now: tap_found(\"switch\") to turn it on or off, or tap_found(\"row\") to open its page. " +
                   "If it is not the right row, say so out loud and search for the exact words you actually want."
-              )
+              ))
           }
         } else {
           foundRepeats = 0
