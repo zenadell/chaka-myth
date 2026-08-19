@@ -180,7 +180,6 @@ class ChakaLive(
   // out WITH the picture and forces her to say what she sees and decide.
   @Volatile private var pendingDecision = ""
   @Volatile private var lastFoundAt = 0L
-  @Volatile private var foundRepeats = 0
   @Volatile private var foundLabel = ""
   @Volatile private var foundRowX = -1
   @Volatile private var foundRowY = -1
@@ -492,6 +491,17 @@ class ChakaLive(
     val sys =
       "You are Chaka, watching your owner's Android screen live and helping in real time. " +
       "You can SEE the screen and you can ACT on it with the provided tools.\n" +
+      "\nWHICH TOOLS EXIST DEPENDS ON WHERE YOU ARE IN THE JOB. This is not a rule you have to remember and it is " +
+      "not something you can get wrong — the phone simply offers you a different set of tools at each stage, and " +
+      "the ones that do not apply are not there.\n" +
+      "  LOOKING FOR IT — you can search, scroll and look. You cannot tap, because you do not yet know where.\n" +
+      "  FOUND IT — you can act on it. You cannot search or open apps, because it is on the screen in front of " +
+      "you and going back to look for it again is how you lose it.\n" +
+      "  ASKED THEM SOMETHING — you have NO tools at all until they answer. Not one. If you asked which of two " +
+      "settings they meant, you cannot touch either of them, and you cannot go elsewhere while you wait.\n" +
+      "  DONE — it is finished and you have read the result off the control. Nothing is left to do to it.\n" +
+      "If you reach for a tool that is not live, you are told which ones ARE, in that moment. Take one of those, " +
+      "or speak. Never call the same unavailable tool twice — it will not appear.\n" +
       "\nYOUR EYES ARE ALWAYS OPEN. The phone streams you a picture every time the screen changes, a fresh one " +
       "immediately BEFORE each action you take, and another immediately AFTER it lands. You are not working from a " +
       "text list with the occasional photograph — you are watching, continuously, the way a person looking over " +
@@ -1028,8 +1038,16 @@ class ChakaLive(
               stateActionCount.clear(); triedFromState.clear(); stateVisits.clear()
               noProgressRun = 0
               refusals.clear()
-              Log.i(TAG, "NEW REQUEST: \"$heard\"")
+              phase = Phase.LOCATING
+              Log.i(TAG, "PHASE -> LOCATING for new request: \"$heard\"")
             }
+          }
+
+          // Any real utterance from him ends the wait — that is what she was
+          // waiting for, whatever else it turns out to mean.
+          if (phase == Phase.CLARIFYING && words >= 1) {
+            Log.i(TAG, "PHASE CLARIFYING -> LOCATING (he answered)")
+            phase = Phase.LOCATING
           }
 
           synchronized(recentSpeech) {
@@ -1087,6 +1105,13 @@ class ChakaLive(
         Thread { Thread.sleep(700); speaking = false }.also { it.isDaemon = true }.start()
         val said = turnSaid.toString().trim()
         turnSaid.setLength(0)
+        // A question to him means her hands go away until he answers. She read
+        // out the options, asked which one, and toggled USB debugging on and
+        // then off before he had said a word.
+        if (said.contains("?") && taskActive) {
+          if (phase != Phase.CLARIFYING) Log.i(TAG, "PHASE -> CLARIFYING (she asked: \"${said.takeLast(60)}\")")
+          phase = Phase.CLARIFYING
+        }
         Log.i(TAG, "turnComplete said=\"${said.take(90)}\" tool=$toolCalledThisTurn")
         if (said.isNotEmpty()) ChakaGuideOverlay.update(said.take(160))
 
@@ -2387,6 +2412,137 @@ class ChakaLive(
       )
   }
 
+  /**
+   * THE PHASE MACHINE — one mechanism replacing a drawer full of guards.
+   *
+   * Eleven separate guard-caused failures in a single day, several where the
+   * fix for one created the next, all share a root the literature names
+   * exactly: the model is being used as BOTH the executor and the orchestrator
+   * — the thing doing the work and the thing deciding what work is valid. Every
+   * guard I wrote was a plea to the model not to misbehave, evaluated against a
+   * transcript that is frequently wrong, in an action space where every tool is
+   * callable at every moment.
+   *
+   * ActionEngine (arXiv 2602.20502) reports 95% task success against 66% for a
+   * vision-only baseline by separating the two: a state machine validates the
+   * transition, the model chooses only within the state it is in.
+   *
+   * So a task moves through phases, and each phase offers a small set of tools.
+   * The failures the owner watched become unrepresentable rather than forbidden:
+   *
+   *   CLARIFYING  she asked him a question. NOTHING may touch the phone until
+   *               he answers. She toggled USB debugging on and off before he
+   *               had replied; in this phase there is no tool with which to.
+   *   LOCATING    she may search, scroll and look. She may not tap.
+   *   READY       it is found. She may tap it. She may NOT go hunting again,
+   *               which is what sent her back to Settings for a row on screen.
+   *   DONE        it is verified. No further actions exist, so she cannot
+   *               "check" a finished job by undoing it.
+   *
+   * A wrong tool is never simply refused — refusals loop, as thirty and sixty
+   * repeated attempts showed. It is answered with the tools that ARE live now,
+   * so there is always somewhere to go.
+   */
+  private enum class Phase { IDLE, CLARIFYING, LOCATING, READY, DONE }
+
+  @Volatile private var phase = Phase.IDLE
+
+  // These touch nothing on the phone — they look, or they write in her own
+  // notebook. Gating them buys no safety and can only wedge her.
+  private val alwaysFine = setOf(
+    "read_screen", "look_at_screen", "read_clipboard", "remember", "recall",
+    "list_memory", "wait", "answer_call", "end_call", "set_plan", "step_done"
+  )
+
+  private val phaseTools: Map<Phase, Set<String>> = mapOf(
+    Phase.IDLE to setOf(
+      "scroll_to", "open_app", "navigate", "press_button", "open_app_drawer",
+      "swipe", "tap_index", "tap_at", "long_press_at", "type_text", "press_enter",
+      "drag", "set_plan", "task_done"
+    ),
+    // He has been asked something. Her hands are put away until he answers.
+    Phase.CLARIFYING to emptySet(),
+    Phase.LOCATING to setOf(
+      "scroll_to", "swipe", "press_button", "open_app", "open_app_drawer",
+      "navigate", "set_plan", "task_done", "type_text", "press_enter", "tap_index"
+    ),
+    Phase.READY to setOf("tap_found", "open_found_target", "set_found_switch", "task_done", "type_text", "press_enter"),
+    Phase.DONE to setOf("task_done")
+  )
+
+  private fun phaseGate(name: String): JSONObject? {
+    if (name in alwaysFine) return null
+    if (name in (phaseTools[phase] ?: emptySet())) return null
+
+    // Before refusing her a search, check she is not right. READY means "it is
+    // in front of you" — if the screen moved and it is no longer there, then
+    // she needs to look for it again and the honest answer is yes.
+    //
+    // This costs one tree read, and only on the path that was about to say no.
+    if (phase == Phase.READY && foundLabel.isNotBlank()) {
+      val still = runCatching { service.findByText(foundLabel) }.getOrNull()
+      if (still.isNullOrBlank() || still.contains("\"error\"")) {
+        Log.i(TAG, "PHASE READY -> LOCATING ('$foundLabel' has left the screen — she is right to look again)")
+        phase = Phase.LOCATING
+        foundLabel = ""
+        if (name in (phaseTools[phase] ?: emptySet())) return null
+      }
+    }
+    val live = ((phaseTools[phase] ?: emptySet()) + alwaysFine).sorted()
+    Log.w(TAG, "PHASE $phase does not allow '$name' — offering ${live.take(6)}")
+    val why = when (phase) {
+      Phase.CLARIFYING ->
+        "You have asked them a question and they have not answered yet. Nothing may touch the phone until they do. " +
+          "Wait for their answer."
+      Phase.READY ->
+        "You have already FOUND it. Searching, scrolling or opening apps again is going backwards — it is on screen " +
+          "in front of you. Act on it with tap_found."
+      Phase.DONE ->
+        "This task is finished and verified. There is nothing left to do to it. Going back to check or redo it is " +
+          "how a completed job gets undone."
+      Phase.LOCATING ->
+        "You have not located the target yet. Find it first with scroll_to, then act on it."
+      Phase.IDLE -> "There is no task running."
+    }
+    return JSONObject()
+      .put("ok", false)
+      .put("phase", phase.name)
+      .put("error", why)
+      .put("available_now", JSONArray(live))
+      .put("do_now", "Use one of available_now, or speak to them. Do not retry this tool — it does not exist right now.")
+  }
+
+  /**
+   * A dangerous row was found, so she never gets the hands to touch it.
+   *
+   * Measured against the live API: asked to "turn on the AT thing" she went
+   * straight for 3GPP AT commands, which restarts the phone. The denylist would
+   * have refused the tap — but refusing a tap is where every loop starts, and
+   * refusal is the design the owner asked me to stop relying on.
+   *
+   * So the FIND itself decides the phase. Finding something destructive that he
+   * did not name puts her in CLARIFYING, where no tool exists at all. She
+   * cannot tap it, cannot try it another way, and cannot go around it. The only
+   * thing left is to ask him — which is what a person would do.
+   */
+  private fun clarifyIfDangerous(label: String): JSONObject? {
+    if (label.isBlank()) return null
+    val danger = dangerBlocked(listOf(label)) ?: return null
+    Log.w(TAG, "PHASE -> CLARIFYING — found dangerous '$label' that he never named")
+    phase = Phase.CLARIFYING
+    foundLabel = ""
+    return JSONObject()
+      .put("ok", false)
+      .put("phase", "CLARIFYING")
+      .put("found_but_refused", label)
+      .put("error", danger.optString("error", "\"$label\" is destructive and they did not ask for it by name."))
+      .put(
+        "do_now",
+        "Say the words \"$label\" out loud to them and ask if that is really what they meant. You have no tools " +
+          "until they answer."
+      )
+  }
+
   private fun planText(): String {
     if (plan.isEmpty()) return "(no plan set — call set_plan if this needs more than one step)"
     return "GOAL: $planGoal\n" + plan.mapIndexed { i, st ->
@@ -2705,6 +2861,9 @@ class ChakaLive(
           "Android is performing the exact Wireless debugging check now. Do not issue any model-driven action or scroll."
         )
     }
+    // ONE gate, before anything else. The phase decides what exists.
+    phaseGate(name)?.let { return it }
+
     val dump = runCatching { JSONObject(service.dumpScreen()) }.getOrNull()
       ?: return JSONObject().put("error", "couldn't read the screen")
 
@@ -2776,7 +2935,6 @@ class ChakaLive(
     // few lines later and can never reach its own limit. That is exactly what
     // happened: fifteen identical searches, guard never fired once.
     // Doing something with what she found clears the "stop re-finding it" state.
-    if (name in TOUCHES_THE_PHONE && name != "scroll_to") { foundRepeats = 0 }
     if (name in TOUCHES_THE_PHONE && name != "swipe" && name != "scroll_to") {
       huntFor = ""; huntSwipes = 0; huntReversals = 0; huntDir = ""
     }
@@ -2978,7 +3136,9 @@ class ChakaLive(
         }
         lastVerified = false
         if (planStep < plan.size) planStep++
-        Log.i(TAG, "step_done -> now on step ${planStep + 1}/${plan.size}")
+        // A new step is a new target: give her back the searching tools.
+        if (planStep < plan.size) { phase = Phase.LOCATING; foundLabel = "" }
+        Log.i(TAG, "step_done -> now on step ${planStep + 1}/${plan.size} (phase $phase)")
         JSONObject().put("ok", true).put("plan", planText())
           .put(
             "next",
@@ -3221,7 +3381,10 @@ class ChakaLive(
             // found nothing stored and she started from scratch.
             taskActive = false
             lockedTarget = ""
-            foundRepeats = 0
+            // ...but only if this WAS the job. Sealing a multi-step plan after
+            // its first toggle would wedge her out of steps two and three.
+            phase = if (plan.isEmpty() || planStep >= plan.size - 1) Phase.DONE else Phase.LOCATING
+            Log.i(TAG, "PHASE -> $phase after toggle (step ${planStep + 1}/${plan.size})")
             return JSONObject()
               .put("ok", true)
               .put("tapped", foundLabel)
@@ -3243,44 +3406,37 @@ class ChakaLive(
       }
       "scroll_to" -> {
         val target = args.optString("target").trim()
-        // Same guard as swiping, for the same reason: she called this fifteen
-        // times for one target, alternating direction, once it started failing.
-        // Already found, nothing done since. Searching again cannot help.
-        if (foundLabel.isNotBlank() && sameTargetish(target, foundLabel)) {
-          foundRepeats++
-          // ALWAYS AN ESCAPE. Refusing forever is worse than the loop it
-          // replaced: the stored find was the WRONG row, so she could neither
-          // act on it nor search past it, and the guard refused 62 times in a
-          // row. A guard that cannot be satisfied is a trap.
-          if (foundRepeats >= 4) {
-            Log.w(TAG, "clearing stale find '$foundLabel' — refused $foundRepeats times, letting her search again")
-            foundLabel = ""; foundRowX = -1; foundRowY = -1
-            foundSwitchX = -1; foundSwitchY = -1; foundRepeats = 0
-          } else if (foundRepeats >= 2) {
-            Log.w(TAG, "scroll_to REFUSED — '$target' already located ($foundRepeats), no action taken")
-            pendingLook = true
-            return refusing("refind:${target.lowercase()}", JSONObject()
-              .put("ok", false)
-              .put("already_found", foundLabel)
-              .put(
-                "error",
-                "You have already found \"$foundLabel\" and have not done anything with it. Searching again finds " +
-                  "the same thing in the same place."
-              )
-              .put(
-                "do_now",
-                "ACT on it now: tap_found(\"switch\") to turn it on or off, or tap_found(\"row\") to open its page. " +
-                  "If it is not the right row, say so out loud and search for the exact words you actually want."
-              ))
-          }
-        } else {
-          foundRepeats = 0
-        }
         val hkey = "scrollto:${target.lowercase()}"
         if (hkey == huntFor) huntSwipes++ else { huntFor = hkey; huntSwipes = 1; huntReversals = 0 }
+        // Two tiers, and the second one is a PHASE, not a plea.
+        //
+        // At three failures by the same name, looking at the picture and using
+        // the words actually printed on the row is a genuinely different act,
+        // so she is asked to do that. At five, searching is over: she moves to
+        // CLARIFYING, where no tool exists at all and the only thing left is to
+        // ask him. Every previous version of this simply said "refused", which
+        // she could and did ignore thirty times in a row.
+        if (huntSwipes >= 5) {
+          Log.w(TAG, "PHASE -> CLARIFYING — $huntSwipes searches for '$target', she must ask now")
+          huntFor = ""; huntSwipes = 0; huntReversals = 0; huntDir = ""
+          phase = Phase.CLARIFYING
+          pendingLook = true
+          return JSONObject()
+            .put("ok", false)
+            .put("phase", "CLARIFYING")
+            .put(
+              "error",
+              "\"$target\" is not on this phone under that name — you have looked $huntSwipes times."
+            )
+            .put(
+              "do_now",
+              "A picture follows. Tell them out loud what you CAN see, and ask them what it is called or where to " +
+                "look. You have no tools until they answer; that is deliberate."
+            )
+            .put("screen_now", screenBrief(dump))
+        }
         if (huntSwipes >= 3) {
-          Log.w(TAG, "scroll_to REFUSED — $huntSwipes searches for '$target'")
-          huntFor = ""; huntSwipes = 0
+          Log.w(TAG, "scroll_to: $huntSwipes searches for '$target' — sending her to the picture")
           pendingLook = true
           return JSONObject()
             .put("ok", false)
@@ -3343,7 +3499,9 @@ class ChakaLive(
             pendingLook = true
             huntFor = ""; huntSwipes = 0; huntReversals = 0; huntDir = ""
             lockTarget(target, n.has("switch_is"))
+            clarifyIfDangerous(n.optString("label"))?.let { return it }
             foundLabel = n.optString("label"); lastFoundAt = System.currentTimeMillis()
+            phase = Phase.READY
             pendingDecision =
               "[SYSTEM] You have found \"${n.optString("label")}\" and you are looking at that screen RIGHT NOW. " +
                 "Read it. Say out loud what you can see around it. Then DECIDE and do it in this same turn: act with " +
@@ -3429,7 +3587,9 @@ class ChakaLive(
               // the right-hand edge. Tapping the words opens the setting's own
               // page; tapping the switch toggles it.
               val w = dump.optInt("w", 720)
+              clarifyIfDangerous(o.optString("text"))?.let { return it }
               foundLabel = o.optString("text"); lastFoundAt = System.currentTimeMillis()
+              phase = Phase.READY
               pendingDecision =
                 "[SYSTEM] You have found \"${o.optString("text")}\" and you are looking at that screen RIGHT NOW. " +
                   "Read it. Say out loud what you can see around it — the other rows near it, and whether each is on " +
@@ -3601,6 +3761,9 @@ class ChakaLive(
           Log.w(TAG, "HUNT HALTED after $huntSwipes swipes / $huntReversals turns for \"$goal\"")
           huntFor = ""; huntSwipes = 0; huntReversals = 0; huntDir = ""
           taskActive = false
+          // Not "please stop" — there is now nothing to stop with. CLARIFYING
+          // has no tools, so the swiping ends whether she agrees or not.
+          phase = Phase.CLARIFYING
           pendingLook = true
           return JSONObject()
             .put("ok", false)
@@ -3831,6 +3994,7 @@ class ChakaLive(
         // Second call, made after seeing the screen — accept it.
         awaitingDoneProof = false
         taskActive = false
+        phase = Phase.IDLE
         drives = 0
         autoContinues = 0
         clearTargetLock()
