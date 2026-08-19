@@ -3069,6 +3069,36 @@ class ChakaLive(
         val y = if (wantSwitch && foundSwitchY >= 0) foundSwitchY else foundRowY
         Log.i(TAG, "tap_found ${if (wantSwitch) "switch" else "row"} of '$foundLabel' at $x,$y")
         service.tap(x, y)
+
+        // READ THE SWITCH BACK. She turned USB debugging ON correctly, could not
+        // confirm it had worked, went back, scrolled down and turned it OFF
+        // again — undoing the task she had just completed, and the owner had to
+        // step in and stop her. tap_index has had this protection for months
+        // (checkbox_is_now); tap_found shipped without it.
+        //
+        // The state is a fact on the control. Reading it costs nothing and ends
+        // the doubt that makes her repeat a completed action.
+        if (wantSwitch) {
+          Thread.sleep(600)
+          val after = runCatching { service.findByText(foundLabel) }.getOrNull()
+            ?.let { runCatching { JSONObject(it) }.getOrNull() }
+          val nowIs = after?.optString("switch_is").orEmpty()
+          if (nowIs.isNotBlank()) {
+            Log.i(TAG, "tap_found: '$foundLabel' is now $nowIs")
+            return JSONObject()
+              .put("ok", true)
+              .put("tapped", foundLabel)
+              .put("switch_is_now", nowIs)
+              .put(
+                "DONE",
+                "\"$foundLabel\" is now $nowIs. That is read straight off the control, so it is certain. THE CHANGE " +
+                  "IS COMPLETE. Do NOT tap it again, do NOT go back to check it, and do NOT search for it again — " +
+                  "tapping it a second time would undo exactly what you just did."
+              )
+              .put("say_now", "Tell the user in one short sentence that it is now $nowIs, then stop.")
+              .put("screen_now", screenBrief(dump))
+          }
+        }
         withOutcome(
           dump, "tap_found:${if (wantSwitch) "switch" else "row"}:$foundLabel",
           JSONObject().put("ok", true).put("tapped", foundLabel).put("at", "$x,$y")
