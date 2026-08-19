@@ -12,6 +12,8 @@ import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
 import android.util.Log
+import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.TimeUnit
 
 /**
  * A second pair of ears, whose only job is to say whether a HUMAN spoke.
@@ -47,6 +49,12 @@ class ChakaEars(private val context: Context) {
   private var writeEnd: ParcelFileDescriptor.AutoCloseOutputStream? = null
   private var readEnd: ParcelFileDescriptor? = null
 
+  // Small on purpose: about a second of audio. If the recogniser falls behind,
+  // the right answer is to lose ITS audio, never to slow the live conversation.
+  private val queue = ArrayBlockingQueue<ByteArray>(24)
+  private var writer: Thread? = null
+  @Volatile private var stopped = false
+  @Volatile private var dropped = 0
   @Volatile private var turns = 0
   @Volatile private var errors = 0
   @Volatile private var listening = false
@@ -145,6 +153,7 @@ class ChakaEars(private val context: Context) {
       override fun onPartialResults(partialResults: Bundle?) {}
       override fun onEvent(eventType: Int, params: Bundle?) {}
     })
+    startWriter()
     listen()
   }
 
@@ -188,8 +197,34 @@ class ChakaEars(private val context: Context) {
    */
   fun feed(pcm: ByteArray, length: Int) {
     if (!listening) return
-    runCatching { writeEnd?.write(pcm, 0, length) }
-      .onFailure { listening = false }
+    // NEVER write from the caller's thread. The caller is the microphone loop
+    // that streams Live Mode's audio, and a pipe holds only about 64KB: the
+    // moment the recogniser stops draining it, write() blocks forever and takes
+    // the microphone thread with it.
+    //
+    // That is exactly what happened. Video frames kept streaming from their own
+    // thread while the conversation went completely silent for five minutes —
+    // she was not thinking, she was deaf and mute, because this call was stuck.
+    // The comment above it claimed it was non-blocking. It was not.
+    //
+    // offer() drops on a full queue. Losing audio from the SECOND listener is
+    // nothing; losing it from the first is everything.
+    if (!queue.offer(pcm.copyOf(length))) dropped++
+  }
+
+  /** Drains into the pipe well away from the microphone. */
+  private fun startWriter() {
+    if (writer != null) return
+    writer = Thread {
+      while (!stopped) {
+        val chunk = runCatching { queue.poll(200, TimeUnit.MILLISECONDS) }.getOrNull() ?: continue
+        runCatching { writeEnd?.write(chunk) }
+          .onFailure {
+            // The pipe is gone or full. Drop this turn rather than wedge here.
+            listening = false
+          }
+      }
+    }.also { it.isDaemon = true; it.name = "chaka-ears-writer"; it.start() }
   }
 
   /**
@@ -213,6 +248,9 @@ class ChakaEars(private val context: Context) {
   fun stop() {
     listening = false
     available = false
+    stopped = true
+    queue.clear()
+    runCatching { writer?.interrupt() }; writer = null
     main.post {
       runCatching { recognizer?.stopListening() }
       runCatching { recognizer?.destroy() }
