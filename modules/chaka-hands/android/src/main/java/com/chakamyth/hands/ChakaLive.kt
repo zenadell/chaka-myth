@@ -52,6 +52,9 @@ class ChakaLive(
   private var recorder: AudioRecord? = null
   private var player: AudioTrack? = null
   private var aec: AcousticEchoCanceler? = null
+  // A second listener on the same microphone, whose only job is to confirm a
+  // HUMAN spoke. See ChakaEars — this is the owner's noisy-market design.
+  private val ears by lazy { ChakaEars(context) }
 
   @Volatile private var ready = false
   // Session resumption: the server hands out a token we can reconnect with, so
@@ -961,7 +964,7 @@ class ChakaLive(
                   "for their answer."
               )
             }
-          } else if (words >= 5 && !soundsLikeAnInstruction(said)) {
+          } else if (words >= 5 && !aPersonSaidThis(said)) {
             // Heard something, but it does not look like speech aimed at her.
             // Do NOT let it become the request — ask, the way a person would
             // when they half-caught a sentence in a noisy room.
@@ -1366,6 +1369,7 @@ class ChakaLive(
       Log.w(TAG, "no hardware AEC on this device — relying on the half-duplex gate")
     }
     rec.startRecording()
+    runCatching { ears.start() }   // never let the second ears break the first
 
     micThread = Thread {
       // ~100ms per chunk keeps latency low without spamming tiny frames.
@@ -1379,6 +1383,9 @@ class ChakaLive(
         // Don't stream our own output back in — that's what kept "interrupting"
         // her mid-sentence and leaving turns empty.
         if (speaking) continue
+        // Same bytes, two listeners: Gemini for the conversation, ChakaEars to
+        // say whether that was a person or the room.
+        runCatching { ears.feed(buf, n) }
         val b64 = Base64.encodeToString(buf.copyOf(n), Base64.NO_WRAP)
         try {
           ws.send(
@@ -2146,6 +2153,31 @@ class ChakaLive(
    * on the odd stray phrase, so this rejects only what is clearly not English
    * instruction.
    */
+  /**
+   * Was that the owner, or the room?
+   *
+   * The second recogniser is the real evidence: it only reports when actual
+   * words were recognised, so noise, music and crowd never satisfy it. When it
+   * cannot tell us — older device, no recogniser, nothing reported yet — we
+   * fall back to judging the transcript, and if that is also unsure we let it
+   * through. Being deaf to him is far worse than acting on a stray phrase.
+   */
+  private fun aPersonSaidThis(said: String): Boolean {
+    when (ears.heardHumanSpeech()) {
+      true -> {
+        Log.i(TAG, "ears confirm a person spoke (\"${ears.lastWords.take(40)}\")")
+        return true
+      }
+      false -> {
+        // The recogniser is working and has heard no words recently. This is
+        // the market-full-of-noise case, and the reason for all of it.
+        Log.w(TAG, "ears heard no human speech — treating \"${said.take(40)}\" as noise")
+        return false
+      }
+      null -> return soundsLikeAnInstruction(said)   // cannot tell; judge the words
+    }
+  }
+
   private fun soundsLikeAnInstruction(said: String): Boolean {
     val words = said.lowercase().split(Regex("[^a-z0-9']+")).filter { it.isNotBlank() }
     if (words.size < 3) return false
@@ -3634,6 +3666,7 @@ class ChakaLive(
     driveThread?.interrupt(); driveThread = null
     micThread?.interrupt(); micThread = null
     runCatching { recorder?.stop(); recorder?.release() }; recorder = null
+    runCatching { ears.stop() }
     runCatching { aec?.release() }; aec = null
     runCatching { player?.pause(); player?.flush(); player?.release() }; player = null
     runCatching {
