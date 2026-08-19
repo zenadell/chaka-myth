@@ -17,6 +17,7 @@ const TOOLS=[
  {name:"tap_found",description:"Tap the thing scroll_to just located. part: switch or row.",parameters:P({part:S("switch or row")},["part"])},
  {name:"open_app",description:"Launch an app by name.",parameters:P({app:S("app name")},["app"])},
  {name:"press_button",description:"back, home, recents.",parameters:P({button:S("back|home")},["button"])},
+ {name:"confirm_dialog",description:"Answer the system dialog on screen. choice: accept or dismiss.",parameters:P({choice:S("accept or dismiss")},["choice"])},
  {name:"task_done",description:"Task fully finished.",parameters:P({summary:S("what was done")},["summary"])},
 ];
 
@@ -143,7 +144,16 @@ const SCREEN = `[0] Developer options
 [5] 3GPP AT commands   switch OFF
 [6] Bug report shortcut   switch OFF`;
 
+const DIALOG = `[0] Allow USB debugging?
+[1] The computer's RSA key fingerprint is: 8C:1F:...
+[2] Always allow from this computer   checkbox
+[3] Cancel   button
+[4] OK   button`;
+
 const cases = [
+ {label:"a dialog is in the way -> answer it, do not stare at it",
+  screen:DIALOG, says:"turn on USB debugging",
+  expect:["confirm_dialog"], forbid:[]},
  {label:"vague instruction -> must ASK, not guess",
   screen:SCREEN, says:"turn on the debugging thing",
   expect:["ASK"], forbid:["tap_found","open_app"]},

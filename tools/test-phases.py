@@ -51,6 +51,26 @@ check("she may NOT toggle verbose logging", allowed("DONE","tap_index"), False)
 check("she may report and finish",          allowed("DONE","task_done"), True)
 
 
+print("\nTHE WEDGE YOU JUST HIT — 'Allow USB debugging?' with no way to press OK")
+check("confirm_dialog exists in EVERY phase, including READY and DONE",
+      all(allowed(p_, "confirm_dialog") for p_ in tools), True)
+check("...including while she waits for his answer",
+      allowed("CLARIFYING", "confirm_dialog"), True)
+check("the dialog's own text still goes through the denylist",
+      "dangerBlocked(listOf(dump.optString(\"elements\")" in src, True)
+check("it presses a REAL button by its text, never an estimated coordinate",
+      "service.findByPixels(w)" in src, True)
+
+print("\nTHE OTHER TWO FAULTS FROM YOUR RUN")
+check("the READY escape hatch asks the PIXELS too (OCR finds what the tree cannot)",
+      "findByPixels(foundLabel)" in src, True)
+check("no NUDGE while she waits — talking is the correct move there",
+      "no nudge — she is waiting on his answer" in src, True)
+check("no DRIVE while she waits either",
+      "if (phase == Phase.CLARIFYING) continue" in src, True)
+check("his answer is taken as an ANSWER, not queued as a rival request",
+      "ANSWER to her question (not queued)" in src, True)
+
 print("\nWEDGE CHECKS — a phase machine you cannot leave is worse than no guard")
 print("(every one of these is a failure mode I have actually shipped)")
 check("looking is free in EVERY phase",

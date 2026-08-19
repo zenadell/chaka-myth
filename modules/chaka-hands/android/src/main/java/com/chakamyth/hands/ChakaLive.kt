@@ -661,6 +661,16 @@ class ChakaLive(
         props("part", "string", "switch or row"),
         listOf("part")
       ))
+      .put(fn(
+        "confirm_dialog",
+        "Answer the system dialog that is on screen right now — \"Allow USB debugging?\", a permission prompt, a "
+          + "cookie banner, an \"Are you sure?\". choice:\"accept\" presses the affirmative button (OK / Allow / "
+          + "Turn on / Yes), choice:\"dismiss\" presses the negative one (Cancel / Deny / Not now). The phone finds "
+          + "the button and taps its exact centre, so you never have to aim. Use this the moment a dialog appears — "
+          + "it works in every phase, because a dialog in the way is not progress and not a decision.",
+        props("choice", "string", "accept or dismiss"),
+        listOf("choice")
+      ))
       .put(fn("press_button", "Press a system button: back, home, recents, notifications, quick_settings.", props("button", "string", "back|home|recents|notifications|quick_settings"), listOf("button")))
       .put(fn("open_app", "Launch an app by name.", props("app", "string", "App name, e.g. spotify"), listOf("app")))
       .put(fn("navigate", "Open a website URL in the browser.", props("url", "string", "Full URL"), listOf("url")))
@@ -975,6 +985,16 @@ class ChakaLive(
             Log.w(TAG, "HARD STOP heard: \"$heard\"")
             ChakaGuideOverlay.update("⏸ Stopped")
             pendingUserWord = ""
+          } else if (phase == Phase.CLARIFYING) {
+            // She ASKED him something. Whatever he says next is the answer to
+            // it — never a rival request to be queued and queried.
+            //
+            // Measured live: she asked which debugging he meant, he replied
+            // "go and look it up and see how many debugging I have", and this
+            // branch filed it as a NEW request and had her ask whether to
+            // abandon her own question. He answered her and she argued about it.
+            lastActivityAt = now
+            Log.i(TAG, "ANSWER to her question (not queued): \"$heard\"")
           } else if (taskActive && currentRequest.isNotEmpty() && !isFollowUp(said) && words >= 5) {
             // Busy. Only stop/wait/cancel act immediately (handled above);
             // anything else is queued and confirmed, never applied silently.
@@ -1290,6 +1310,10 @@ class ChakaLive(
    * themselves. Capped so it can't turn into a nagging loop.
    */
   private fun checkTurn(ws: WebSocket, said: String) {
+    if (phase == Phase.CLARIFYING) {
+      Log.i(TAG, "no nudge — she is waiting on his answer, and talking is exactly right")
+      return
+    }
     if (nudges >= 3) { Log.i(TAG, "nudge cap reached — leaving it to the user"); return }
     nudges++
     Thread {
@@ -1325,6 +1349,10 @@ class ChakaLive(
         try {
           Thread.sleep(1500)
           if (!taskActive) continue
+          // "Do not reply with words. Call the next tool" is precisely wrong
+          // while she is waiting on his answer — there is no tool to call, and
+          // the words ARE the work. Waiting quietly for him is not a stall.
+          if (phase == Phase.CLARIFYING) continue
           // Only step in once she's genuinely stalled — not between her own
           // actions, and never straight after the user has spoken.
           if (System.currentTimeMillis() - lastActivityAt < 8000) continue
@@ -2451,7 +2479,14 @@ class ChakaLive(
   // notebook. Gating them buys no safety and can only wedge her.
   private val alwaysFine = setOf(
     "read_screen", "look_at_screen", "read_clipboard", "remember", "recall",
-    "list_memory", "wait", "answer_call", "end_call", "set_plan", "step_done"
+    "list_memory", "wait", "answer_call", "end_call", "set_plan", "step_done",
+    // A dialog standing in the way is not progress and not a decision — it is
+    // an obstacle, and every phase must be able to clear one. Measured live:
+    // tap_found turned on USB debugging, Android raised "Allow USB debugging?",
+    // and READY had no tool that could press OK. She tried tap_index twice and
+    // tap_at once, was refused three times, and the task simply stopped. That
+    // is the trap I promised not to build, built anyway.
+    "confirm_dialog"
   )
 
   private val phaseTools: Map<Phase, Set<String>> = mapOf(
@@ -2480,8 +2515,11 @@ class ChakaLive(
     //
     // This costs one tree read, and only on the path that was about to say no.
     if (phase == Phase.READY && foundLabel.isNotBlank()) {
+      val gone = { r: String? -> r.isNullOrBlank() || r.contains("\"error\"") }
       val still = runCatching { service.findByText(foundLabel) }.getOrNull()
-      if (still.isNullOrBlank() || still.contains("\"error\"")) {
+        .takeUnless { gone(it) }
+        ?: runCatching { service.findByPixels(foundLabel) }.getOrNull()
+      if (gone(still)) {
         Log.i(TAG, "PHASE READY -> LOCATING ('$foundLabel' has left the screen — she is right to look again)")
         phase = Phase.LOCATING
         foundLabel = ""
@@ -2541,6 +2579,63 @@ class ChakaLive(
         "Say the words \"$label\" out loud to them and ask if that is really what they meant. You have no tools " +
           "until they answer."
       )
+  }
+
+  /** The words a system dialog answers with, in the order we would prefer them. */
+  private val acceptWords = listOf(
+    "always allow", "allow", "ok", "okay", "turn on", "turn off", "yes", "confirm",
+    "continue", "agree", "accept", "got it", "done", "enable", "install", "update"
+  )
+  private val dismissWords = listOf(
+    "cancel", "deny", "don't allow", "dont allow", "no thanks", "not now", "no", "later", "close", "dismiss"
+  )
+
+  /**
+   * Find and press the dialog button, by its own text, at its own centre.
+   *
+   * The tree is asked first and the pixels second — the same order that made
+   * finding work everywhere else. Nothing is estimated: if neither can see a
+   * button, she is told so plainly rather than being invited to guess at a
+   * coordinate, because guessing at a coordinate over a dialog is how you press
+   * the wrong half of "Allow / Deny".
+   */
+  private fun runConfirmDialog(choice: String, dump: JSONObject): JSONObject {
+    val wants = if (choice.lowercase().startsWith("dis") || choice.lowercase().startsWith("no")) dismissWords else acceptWords
+    val screenText = dump.optString("elements").lowercase()
+
+    // The dialog's own words are still his phone's business. "Erase all data?"
+    // must not be waved through just because it arrived as a dialog.
+    dangerBlocked(listOf(dump.optString("elements").take(400)))?.let {
+      Log.w(TAG, "confirm_dialog: dialog text looks destructive and he did not name it")
+      phase = Phase.CLARIFYING
+      return it.put("phase", "CLARIFYING")
+        .put("do_now", "Read the dialog out to them word for word and ask before touching it. You have no tools until they answer.")
+    }
+
+    for (w in wants) {
+      if (!screenText.contains(w)) continue
+      val hit = runCatching { service.findByText(w) }.getOrNull()
+        ?: runCatching { service.findByPixels(w) }.getOrNull() ?: continue
+      val o = runCatching { JSONObject(hit) }.getOrNull() ?: continue
+      val cx = o.optInt("row_cx", o.optInt("cx", -1))
+      val cy = o.optInt("row_cy", o.optInt("cy", -1))
+      if (cx < 0 || cy < 0) continue
+      Log.i(TAG, "confirm_dialog($choice) -> pressing '$w' at $cx,$cy")
+      service.tap(cx, cy)
+      Thread.sleep(700)
+      pendingLook = true
+      return JSONObject()
+        .put("ok", true)
+        .put("pressed", w)
+        .put("at", "$cx,$cy")
+        .put("note", "The dialog is answered. Carry on with the task — do not repeat the action that raised it.")
+        .put("screen_now", screenBrief(runCatching { JSONObject(service.dumpScreen()) }.getOrNull() ?: dump))
+    }
+    Log.i(TAG, "confirm_dialog($choice) -> no $choice button found on screen")
+    return JSONObject()
+      .put("ok", false)
+      .put("error", "There is no ${if (wants === acceptWords) "accept" else "dismiss"} button on screen — no dialog is in the way.")
+      .put("do_now", "Carry on with the task itself.")
   }
 
   private fun planText(): String {
@@ -4053,6 +4148,7 @@ class ChakaLive(
       }
       "answer_call" -> JSONObject().put("ok", service.answerCall())
       "end_call" -> JSONObject().put("ok", service.endCall())
+      "confirm_dialog" -> return runConfirmDialog(args.optString("choice", "accept"), dump)
       "press_button" -> {
         val b = args.optString("button", "back")
         // Back right after picking an icon up CANCELS the move. She did this
