@@ -2171,17 +2171,26 @@ class ChakaLive(
     val said = (currentRequest + " " + synchronized(recentSpeech) { recentSpeech.toString() }).lowercase()
     if (said.isBlank()) return null
     val els = dump.optJSONArray("els") ?: return null
+    var best: Triple<String, Int, Int>? = null
     for (k in 0 until els.length()) {
       val e = els.optJSONObject(k) ?: continue
       val label = listOf(e.optString("text"), e.optString("desc"))
         .filter { it.isNotBlank() }.joinToString(" ").trim()
       if (label.length < 5) continue
-      val words = label.lowercase().split(Regex("[^a-z0-9]+")).filter { it.length > 3 }
-      if (words.isEmpty()) continue
+      // TWO real words, so a section HEADER can never be mistaken for a control.
+      // "Debugging" is a heading; "USB debugging" is a setting. Taking the first
+      // match in tree order picked the heading — the heading comes first — and
+      // that is the same mistake that cost an evening earlier, where matching on
+      // one long word sent her to tap a title.
+      val words = label.lowercase().split(Regex("[^a-z0-9]+")).filter { it.length >= 3 }
+      if (words.size < 2) continue
       if (!said.contains(label.lowercase())) continue
-      return Triple(label, e.optInt("cx"), e.optInt("cy"))
+      // Most specific wins: "USB debugging" beats "Debugging" every time.
+      if (best == null || label.length > best!!.first.length) {
+        best = Triple(label, e.optInt("cx"), e.optInt("cy"))
+      }
     }
-    return null
+    return best
   }
 
   private fun labelsAt(dump: JSONObject, x: Int, y: Int): List<String> {
