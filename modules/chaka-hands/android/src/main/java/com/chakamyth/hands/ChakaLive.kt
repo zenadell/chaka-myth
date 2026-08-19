@@ -961,6 +961,19 @@ class ChakaLive(
                   "for their answer."
               )
             }
+          } else if (words >= 5 && !soundsLikeAnInstruction(said)) {
+            // Heard something, but it does not look like speech aimed at her.
+            // Do NOT let it become the request — ask, the way a person would
+            // when they half-caught a sentence in a noisy room.
+            Log.w(TAG, "not an instruction, asking instead: \"$heard\"")
+            socket?.let { ws ->
+              sendText(
+                ws,
+                "[SYSTEM] What was heard did not come through as a clear instruction: \"$heard\". Do NOT act on it and " +
+                  "do NOT treat it as a task. Say, in one short friendly sentence, that you did not catch that and ask " +
+                  "them to say it again. Then wait."
+              )
+            }
           } else if (words >= 5 && now - haltedAt > 6000) {
             // Five words, and not straight after a stop. Three was low enough
             // that background chatter started tasks; and a stop that any noise
@@ -1651,11 +1664,20 @@ class ChakaLive(
     if (plan.isEmpty() && currentRequest.isBlank()) return null
     val t = target.lowercase()
     val scope = (planGoal + " " + plan.joinToString(" ") + " " + currentRequest + " " +
-      synchronized(recentSpeech) { recentSpeech.toString() }).lowercase()
+      synchronized(recentSpeech) { recentSpeech.toString() }).lowercase().trim()
+    // NO BOUNDARY, NO BLOCK. Judging "is this app part of the task?" requires
+    // knowing the task. With an empty scope this refused to open Settings —
+    // where most of her work happens — on the basis of nothing at all. A guard
+    // with no evidence must stand down, not guess.
+    if (scope.length < 8) return null
+    // Settings and the launcher are not wandering. They are how you get
+    // anywhere, and blocking them strands her at the first step of almost
+    // every task she is ever given.
+    if (t.contains("setting") || t.contains("launcher") || t.contains("home")) return null
     // Mentioned anywhere in the goal, the steps, or what the user has said? Fine.
     val words = t.split(Regex("[^a-z0-9]+")).filter { it.length > 2 }
     if (words.isEmpty() || words.any { scope.contains(it) }) return null
-    Log.w(TAG, "OFF-PLAN blocked: '$target' is not part of \"$planGoal\"")
+    Log.w(TAG, "OFF-PLAN blocked: '$target' — scope was \"${scope.take(120)}\"")
     return JSONObject()
       .put("ok", false)
       .put("off_plan", true)
@@ -2102,6 +2124,43 @@ class ChakaLive(
       return listOf(e.optString("text"), e.optString("desc")).filter { it.isNotBlank() }.joinToString(" ")
     }
     return null
+  }
+
+  /**
+   * Is this a human giving an instruction, or is it the room?
+   *
+   * The owner's web assistant runs the browser's own recogniser alongside the
+   * audio stream with interimResults=false, so it only reports when real WORDS
+   * were recognised — music, crowd and singing never produce a final result.
+   * That second opinion is why it can sit in a noisy market and not react until
+   * genuinely spoken to.
+   *
+   * Android will not hand the microphone to a second recogniser while the Live
+   * socket is streaming from it, so the same principle is applied to the
+   * transcript instead: an instruction has to look like one. Gemini transcribed
+   * "turn on the debugging thing" as "Ton nom de debugging team", that nonsense
+   * became the_request, and every guard downstream then reasoned carefully
+   * about garbage — blocking Settings, and picking the wrong control.
+   *
+   * Deliberately generous. Refusing to hear the owner is far worse than acting
+   * on the odd stray phrase, so this rejects only what is clearly not English
+   * instruction.
+   */
+  private fun soundsLikeAnInstruction(said: String): Boolean {
+    val words = said.lowercase().split(Regex("[^a-z0-9']+")).filter { it.isNotBlank() }
+    if (words.size < 3) return false
+    // Ordinary connective English. Real speech is full of it; a mistranscription
+    // of noise, or of another language, usually is not.
+    val common = setOf(
+      "the","a","an","is","are","was","it","this","that","to","on","off","in","of","and","or","for",
+      "my","me","you","your","i","can","could","would","please","do","does","did","go","get","open",
+      "turn","check","find","tell","show","what","where","which","how","if","not","don't","dont",
+      "now","then","back","up","down","with","from","have","has","need","want","let","make","see","look"
+    )
+    val hits = words.count { it in common }
+    // At least a fifth of it should be everyday English, or it is not a sentence
+    // said to her — it is something the microphone happened to pick up.
+    return hits.toDouble() / words.size >= 0.20
   }
 
   private fun planText(): String {
