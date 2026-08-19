@@ -171,6 +171,7 @@ class ChakaLive(
   // in between. There was a guard for searching and failing, and none for
   // searching and succeeding — so she found "USB debugging" roughly forty times
   // in forty seconds, each one a round trip, and never once acted on it.
+  @Volatile private var lastFoundAt = 0L
   @Volatile private var foundRepeats = 0
   @Volatile private var foundLabel = ""
   @Volatile private var foundRowX = -1
@@ -1180,6 +1181,22 @@ class ChakaLive(
         "A real screenshot follows: look at it, then correct what you told them."
     }
 
+    // "I could not find it" while the phone has it located is not a mistake, it
+    // is a false report — and the owner acted on it, stepping in to do the job
+    // himself. She stopped ON the row, said she could not find it, then wandered
+    // off and switched Developer options off. The native side knows better.
+    val claimsMissing = listOf(
+      "couldn't find", "could not find", "can't find", "cannot find",
+      "unable to find", "not able to find", "didn't find", "did not find",
+      "isn't there", "is not there", "doesn't seem to be", "does not appear"
+    ).any { s.contains(it) }
+    if (claimsMissing && foundLabel.isNotBlank() && now - lastFoundAt < 60000) {
+      Log.w(TAG, "FALSE CLAIM (missing): says not found, but '$foundLabel' is located")
+      return "[SYSTEM] You just told the user you could not find it. That is NOT TRUE — the phone has \"" +
+        foundLabel + "\" located on screen right now, and you were given its exact position. Do not say it is " +
+        "missing. Either act on it with tap_found, or say precisely what you can see and ask them."
+    }
+
     val claimsDone = listOf(
       "i've tapped", "ive tapped", "i tapped", "i've opened", "ive opened", "i opened",
       "i've sent", "ive sent", "i sent", "i've typed", "ive typed", "i typed",
@@ -1625,9 +1642,16 @@ class ChakaLive(
    * turns up somewhere unrelated.
    */
   private fun offPlanGuard(target: String): JSONObject? {
-    if (plan.isEmpty() || target.isBlank()) return null
+    if (target.isBlank()) return null
+    // NOT conditional on a plan existing. This guard used to give up whenever
+    // plan was empty — and she only sets a plan for jobs she thinks are hard,
+    // so every "simple" task ran with no wandering protection at all. That is
+    // how she left a half-finished job and turned up in another app entirely.
+    // With no plan, the request itself is the boundary.
+    if (plan.isEmpty() && currentRequest.isBlank()) return null
     val t = target.lowercase()
-    val scope = (planGoal + " " + plan.joinToString(" ") + " " + currentRequest).lowercase()
+    val scope = (planGoal + " " + plan.joinToString(" ") + " " + currentRequest + " " +
+      synchronized(recentSpeech) { recentSpeech.toString() }).lowercase()
     // Mentioned anywhere in the goal, the steps, or what the user has said? Fine.
     val words = t.split(Regex("[^a-z0-9]+")).filter { it.length > 2 }
     if (words.isEmpty() || words.any { scope.contains(it) }) return null
@@ -2959,7 +2983,7 @@ class ChakaLive(
             pendingLook = true
             huntFor = ""; huntSwipes = 0; huntReversals = 0; huntDir = ""
             lockTarget(target, n.has("switch_is"))
-            foundLabel = n.optString("label")
+            foundLabel = n.optString("label"); lastFoundAt = System.currentTimeMillis()
             foundRowX = n.optInt("row_cx", n.optInt("cx")); foundRowY = n.optInt("row_cy", n.optInt("cy"))
             foundSwitchX = n.optInt("switch_cx", -1); foundSwitchY = n.optInt("switch_cy", -1)
             val res = JSONObject()
@@ -3040,7 +3064,7 @@ class ChakaLive(
               // the right-hand edge. Tapping the words opens the setting's own
               // page; tapping the switch toggles it.
               val w = dump.optInt("w", 720)
-              foundLabel = o.optString("text")
+              foundLabel = o.optString("text"); lastFoundAt = System.currentTimeMillis()
               foundRowX = o.optInt("cx"); foundRowY = o.optInt("cy")
               foundSwitchX = (w * 0.87).toInt(); foundSwitchY = o.optInt("cy")
               return JSONObject()
