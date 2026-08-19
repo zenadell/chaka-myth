@@ -2144,6 +2144,72 @@ class ChakaLive(
   }
 
   /** The switch under a point, so a coordinate tap is checked like a named one. */
+  /**
+   * EVERY label under the point, whatever the tree calls it.
+   *
+   * The old version only looked at elements the tree flagged as toggles — and
+   * this is the same tree that hides Wireless debugging, so on Developer
+   * options it flags almost nothing. When she tapped the Developer options
+   * master switch it returned null, changeBlocked never ran, and the tap went
+   * through: developer mode off, wireless debugging cut, the Mac disconnected.
+   *
+   * Never ask the tree what KIND of thing something is. Ask only what it says.
+   */
+  private fun labelsAt(dump: JSONObject, x: Int, y: Int): List<String> {
+    val els = dump.optJSONArray("els") ?: return emptyList()
+    val out = ArrayList<String>()
+    for (k in 0 until els.length()) {
+      val e = els.optJSONObject(k) ?: continue
+      if (x < e.optInt("x1") || x > e.optInt("x2") || y < e.optInt("y1") || y > e.optInt("y2")) continue
+      listOf(e.optString("text"), e.optString("desc")).filter { it.isNotBlank() }
+        .joinToString(" ").takeIf { it.isNotBlank() }?.let { out.add(it) }
+    }
+    return out
+  }
+
+  /**
+   * Controls that must never be touched unless the owner names them himself.
+   *
+   * These are not "probably wrong" — they are the ones that end the session or
+   * the phone. Developer options cuts wireless debugging and locks us out.
+   * 3GPP AT commands can restart the device. Revoking authorisations kills the
+   * ADB pairing. She reached for all three in one run while trying to recover
+   * from an action she could not verify.
+   *
+   * No escalation, no counter, no way to earn permission through persistence:
+   * either the exact words are in what he said, or it does not happen.
+   */
+  private fun dangerBlocked(labels: List<String>): JSONObject? {
+    val said = (currentRequest + " " + synchronized(recentSpeech) { recentSpeech.toString() }).lowercase()
+    val deadly = listOf(
+      "developer option", "developer options", "3gpp", "at command", "oem unlock",
+      "factory reset", "erase all", "wipe", "revoke", "bug report", "restart", "reboot",
+      "sign out", "log out", "delete account", "remove account", "force stop", "uninstall"
+    )
+    for (label in labels) {
+      val l = label.lowercase()
+      val hit = deadly.firstOrNull { l.contains(it) } ?: continue
+      if (said.contains(hit)) continue   // he named it himself — his phone, his call
+      Log.w(TAG, "DANGEROUS BLOCKED: \"$label\" (matched '$hit') — not named in what he asked")
+      return JSONObject()
+        .put("ok", false)
+        .put("dangerous", true)
+        .put("control", label)
+        .put(
+          "error",
+          "\"$label\" can break the phone or cut the connection, and nobody asked for it. This is refused " +
+            "permanently for this task — trying again, another way, or by coordinates will also be refused."
+        )
+        .put(
+          "do_now",
+          "Do not attempt this or anything near it again. Say out loud what you were trying to achieve and ask " +
+            "them what to do. If you were trying to undo or redo something, STOP — check what is already true " +
+            "before changing anything."
+        )
+    }
+    return null
+  }
+
   private fun toggleLabelAt(dump: JSONObject, x: Int, y: Int): String? {
     val els = dump.optJSONArray("els") ?: return null
     for (k in 0 until els.length()) {
@@ -3011,6 +3077,7 @@ class ChakaLive(
         withOutcome(dump, "open_found_target:$target", res)
       }
       "set_found_switch" -> {
+        dangerBlocked(listOf(foundLabel))?.let { return it }
         foundLabel.takeIf { it.isNotBlank() }?.let { l -> changeBlocked(l)?.let { return it } }
         if (!hasTargetLock()) {
           return JSONObject()
@@ -3059,6 +3126,7 @@ class ChakaLive(
       // picture that has already faded, while she fires the next swipe. The
       // element tree answers it exactly, every time, for free.
       "tap_found" -> {
+        dangerBlocked(listOf(foundLabel))?.let { return it }
         foundLabel.takeIf { it.isNotBlank() }?.let { l -> changeBlocked(l)?.let { return it } }
         if (foundLabel.isBlank() || foundRowY < 0) {
           return JSONObject().put("ok", false)
@@ -3084,7 +3152,20 @@ class ChakaLive(
             ?.let { runCatching { JSONObject(it) }.getOrNull() }
           val nowIs = after?.optString("switch_is").orEmpty()
           if (nowIs.isNotBlank()) {
-            Log.i(TAG, "tap_found: '$foundLabel' is now $nowIs")
+            Log.i(TAG, "tap_found: '$foundLabel' is now $nowIs — task closed")
+            // THE JOB IS DONE, SO THE JOB ENDS. Every disaster tonight grew from
+            // one unverified toggle: she turned USB debugging on, could not
+            // confirm it, went back to redo it, mis-tapped Developer options
+            // OFF, cut the connection, re-enabled developer mode by hand, then
+            // hit Bug report shortcut and reached for 3GPP AT commands, which
+            // restarts the phone. Six destructive acts from one moment of doubt.
+            //
+            // The state has just been read off the control. There is nothing
+            // left to check, so leaving the task open only invites her back.
+            taskActive = false
+            lockedTarget = ""
+            foundLabel = ""; foundRowX = -1; foundRowY = -1
+            foundSwitchX = -1; foundSwitchY = -1; foundRepeats = 0
             return JSONObject()
               .put("ok", true)
               .put("tapped", foundLabel)
@@ -3538,6 +3619,7 @@ class ChakaLive(
           // A coordinate tap on a switch is still changing a setting. Without
           // this, every guard could be walked round simply by tapping the
           // pixels instead of naming the row.
+          dangerBlocked(labelsAt(dump, x, y))?.let { return it }
           toggleLabelAt(dump, x, y)?.let { l -> changeBlocked(l)?.let { return it } }
           // Round to a coarse grid: tapping 3px away is the same attempt.
           val gx = (args.optDouble("x") * 10).toInt(); val gy = (args.optDouble("y") * 10).toInt()
@@ -3556,6 +3638,7 @@ class ChakaLive(
           )
         if (x < 0 || y < 0) JSONObject().put("ok", false).put("error", "x and y must be 0..1")
         else {
+          dangerBlocked(labelsAt(dump, x, y))?.let { return it }
           toggleLabelAt(dump, x, y)?.let { l -> changeBlocked(l)?.let { return it } }
           service.swipe(x, y, x, y, 650); JSONObject().put("ok", true)
         }
