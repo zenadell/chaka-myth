@@ -3157,7 +3157,20 @@ class ChakaLive(
           val native = runCatching { service.findByText(target) }.getOrNull()
           Log.i(TAG, "scroll_to step $steps: els=${here.optJSONArray("els")?.length() ?: 0} " +
             "findByText=${native ?: "null"}")
-          if (native != null) {
+          // A match that is not really what was asked for must be IGNORED, not
+          // locked onto. Locking on "Revoke USB debugging authorisations" while
+          // hunting "USB debugging" shut every door at once: tap_at and
+          // tap_index were blocked as "already found exactly", tap_found led to
+          // the Revoke switch, and changeBlocked refused that — three guards,
+          // each correct alone, leaving her nowhere to go.
+          //
+          // The real row is hidden from the tree, so the only tree match is the
+          // one quoting it. Skipping it lets OCR look at the actual pixels,
+          // which can see what the tree will not show.
+          val nativeLabel = native?.let { runCatching { JSONObject(it).optString("label") }.getOrNull() }.orEmpty()
+          if (native != null && nativeLabel.isNotBlank() && !sameTargetish(target, nativeLabel)) {
+            Log.w(TAG, "scroll_to '$target' -> ignoring loose match '$nativeLabel', letting the pixels decide")
+          } else if (native != null) {
             val n = JSONObject(native)
             Log.i(TAG, "scroll_to '$target' -> FOUND natively after $steps steps: $native")
             pendingLook = true
