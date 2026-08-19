@@ -47,6 +47,8 @@ class ChakaEars(private val context: Context) {
   private var writeEnd: ParcelFileDescriptor.AutoCloseOutputStream? = null
   private var readEnd: ParcelFileDescriptor? = null
 
+  @Volatile private var turns = 0
+  @Volatile private var errors = 0
   @Volatile private var listening = false
   @Volatile var available = false
     private set
@@ -68,11 +70,14 @@ class ChakaEars(private val context: Context) {
   private fun startOnMain() {
     // On-device where possible: this runs constantly beside a live call, so it
     // must not be a network round trip or a bill.
+    var onDevice = false
     recognizer = runCatching {
       if (SpeechRecognizer.isOnDeviceRecognitionAvailable(context)) {
+        onDevice = true
         SpeechRecognizer.createOnDeviceSpeechRecognizer(context)
       } else null
     }.getOrNull() ?: runCatching {
+      onDevice = false
       if (SpeechRecognizer.isRecognitionAvailable(context)) SpeechRecognizer.createSpeechRecognizer(context) else null
     }.getOrNull()
 
@@ -81,6 +86,10 @@ class ChakaEars(private val context: Context) {
       return
     }
     available = true
+    // Say so out loud. Silence on success is indistinguishable from silence on
+    // failure, and that ambiguity has now cost two debugging sessions — once
+    // with OCR returning null when starved of frames, and again here.
+    Log.i(TAG, "second ears STARTED (onDevice=$onDevice, api=${Build.VERSION.SDK_INT}) — listening beside the live mic")
     recognizer?.setRecognitionListener(object : RecognitionListener {
       override fun onResults(results: Bundle?) {
         val heard = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
@@ -96,6 +105,33 @@ class ChakaEars(private val context: Context) {
       }
 
       override fun onError(error: Int) {
+        // NO_MATCH and SPEECH_TIMEOUT are the normal sound of a quiet or noisy
+        // room and are not worth logging. Anything else means this is broken,
+        // and broken silently is how it has been all along.
+        if (error != SpeechRecognizer.ERROR_NO_MATCH && error != SpeechRecognizer.ERROR_SPEECH_TIMEOUT) {
+          val name = when (error) {
+            SpeechRecognizer.ERROR_AUDIO -> "AUDIO"
+            SpeechRecognizer.ERROR_CLIENT -> "CLIENT"
+            SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "NO_PERMISSION"
+            SpeechRecognizer.ERROR_NETWORK -> "NETWORK"
+            SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> "BUSY (mic contention)"
+            SpeechRecognizer.ERROR_SERVER -> "SERVER"
+            SpeechRecognizer.ERROR_TOO_MANY_REQUESTS -> "TOO_MANY_REQUESTS"
+            SpeechRecognizer.ERROR_CANNOT_CHECK_SUPPORT -> "CANNOT_CHECK_SUPPORT"
+            SpeechRecognizer.ERROR_LANGUAGE_NOT_SUPPORTED -> "LANG_UNSUPPORTED"
+            SpeechRecognizer.ERROR_LANGUAGE_UNAVAILABLE -> "LANG_UNAVAILABLE"
+            else -> "code $error"
+          }
+          errors++
+          if (errors <= 3 || errors % 20 == 0) Log.w(TAG, "recogniser error: $name (x$errors)")
+          // Repeated hard errors mean this device will not do piped audio.
+          // Stand down rather than spin, and let the transcript check take over.
+          if (errors >= 25) {
+            Log.e(TAG, "giving up on the second ears after $errors errors — transcript checking only")
+            available = false
+            return
+          }
+        }
         // ERROR_NO_MATCH and ERROR_SPEECH_TIMEOUT are the normal outcome of a
         // room full of noise. They are the system telling us nobody spoke.
         restart()
@@ -131,6 +167,8 @@ class ChakaEars(private val context: Context) {
       }
       recognizer?.startListening(intent)
       listening = true
+      if (turns == 0) Log.i(TAG, "piped audio accepted — first listening turn under way")
+      turns++
     }.onFailure {
       listening = false
       Log.e(TAG, "listen: ${it.message}")
