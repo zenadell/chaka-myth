@@ -79,5 +79,19 @@ check("'open whatsapp and message my mum' -> travel allowed", named_target_on_sc
 check("vague 'turn on the debugging thing' -> no match, she must ask",
       named_target_on_screen("turn on the debugging thing"), None)
 
+
+print("\nE. MISTRANSCRIBED REQUEST — the failure that made it go insane")
+e = row("USB debugging")
+# she searched for it by name; the transcript arrived corrupted as "bargain thing"
+def change_blocked(label, said, searched):
+    if searched and searched.lower() == label.lower(): return None   # deliberate search = intent
+    return danger_blocked([label], said)
+check("searched 'USB debugging', heard 'bargain thing' -> ALLOWED",
+      change_blocked("USB debugging", "turn on the bargain thing", "USB debugging"), None)
+check("but 'Developer options' with the same bad transcript -> STILL BLOCKED",
+      change_blocked("Developer options", "turn on the bargain thing", "USB debugging") is not None, True)
+check("and 3GPP AT commands -> STILL BLOCKED",
+      change_blocked("3GPP AT commands", "turn on the bargain thing", "USB debugging") is not None, True)
+
 print(f"\n{'ALL PASS' if not fails else str(fails)+' FAILURES'}")
 sys.exit(1 if fails else 0)

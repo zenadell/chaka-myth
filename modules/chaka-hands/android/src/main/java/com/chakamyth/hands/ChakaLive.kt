@@ -2126,6 +2126,21 @@ class ChakaLive(
       Regex("($verbs)\\W+(\\w+\\W+){0,2}?" + Regex.escape(name)).containsMatchIn(req) ||
       Regex("($verbs)\\W+(\\w+\\W+){0,2}?" + Regex.escape(tokens.firstOrNull() ?: name)).containsMatchIn(req)
 
+    // A DELIBERATE SEARCH IS INTENT. If she searched for this exact control by
+    // name and found it, that is stronger evidence than the transcript — which
+    // is routinely corrupted. "turn on the debugging thing" arrived as "turn on
+    // the bargain thing", so "usb debugging" appeared nowhere in the request and
+    // this guard refused the correct row she had just located. She then pressed
+    // back over and over and went hunting. Three separate failures today have
+    // been this guard reasoning confidently about a mistranscribed sentence.
+    //
+    // The phone is protected by the denylist, which is absolute and needs his
+    // exact words. For an ordinary control, having searched for it is enough.
+    if (sameTargetish(label, lockedTarget) || sameTargetish(label, foundLabel)) {
+      Log.i(TAG, "allowing \"$label\" — she searched for it by name")
+      return null
+    }
+
     if (!mentioned) {
       Log.w(TAG, "BLOCKED change to \"$label\" — never mentioned in \"$currentRequest\"")
       return refusing("change:$name", JSONObject().put("ok", false).put("off_task", true)
