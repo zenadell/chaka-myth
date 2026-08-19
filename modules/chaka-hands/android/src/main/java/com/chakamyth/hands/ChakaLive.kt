@@ -2155,6 +2155,35 @@ class ChakaLive(
    *
    * Never ask the tree what KIND of thing something is. Ask only what it says.
    */
+  /**
+   * The thing he asked about, if it is already in front of her.
+   *
+   * This is the complaint he has repeated all day and I kept explaining away:
+   * she does not look before she moves. Asked to turn off USB debugging while
+   * USB debugging was visible on screen, she went back to Settings, reopened
+   * Developer options, scrolled down, and toggled it three times.
+   *
+   * Matching is by what is ON SCREEN, not by parsing his sentence: any visible
+   * label he actually named is the target, which needs no cleverness and cannot
+   * invent one.
+   */
+  private fun namedTargetOnScreen(dump: JSONObject): Triple<String, Int, Int>? {
+    val said = (currentRequest + " " + synchronized(recentSpeech) { recentSpeech.toString() }).lowercase()
+    if (said.isBlank()) return null
+    val els = dump.optJSONArray("els") ?: return null
+    for (k in 0 until els.length()) {
+      val e = els.optJSONObject(k) ?: continue
+      val label = listOf(e.optString("text"), e.optString("desc"))
+        .filter { it.isNotBlank() }.joinToString(" ").trim()
+      if (label.length < 5) continue
+      val words = label.lowercase().split(Regex("[^a-z0-9]+")).filter { it.length > 3 }
+      if (words.isEmpty()) continue
+      if (!said.contains(label.lowercase())) continue
+      return Triple(label, e.optInt("cx"), e.optInt("cy"))
+    }
+    return null
+  }
+
   private fun labelsAt(dump: JSONObject, x: Int, y: Int): List<String> {
     val els = dump.optJSONArray("els") ?: return emptyList()
     val out = ArrayList<String>()
@@ -3162,10 +3191,13 @@ class ChakaLive(
             //
             // The state has just been read off the control. There is nothing
             // left to check, so leaving the task open only invites her back.
+            // End the task, but REMEMBER WHERE IT IS. Clearing the position
+            // here is what made her walk back to Settings and re-navigate for a
+            // row sitting on screen: the next instruction ("now turn it off")
+            // found nothing stored and she started from scratch.
             taskActive = false
             lockedTarget = ""
-            foundLabel = ""; foundRowX = -1; foundRowY = -1
-            foundSwitchX = -1; foundSwitchY = -1; foundRepeats = 0
+            foundRepeats = 0
             return JSONObject()
               .put("ok", true)
               .put("tapped", foundLabel)
@@ -3852,6 +3884,30 @@ class ChakaLive(
         withOutcome(dump, "press:$b", JSONObject().put("ok", service.globalAction(b)))
       }
       "open_app" -> {
+        // He named something that is ON THIS SCREEN. Leaving to go and find it
+        // is the exact behaviour he has complained about all day: asked to turn
+        // off USB debugging while it was visible, she went back to Settings,
+        // reopened Developer options and toggled it three times.
+        namedTargetOnScreen(dump)?.let { (label, cx, cy) ->
+          Log.w(TAG, "refusing to leave — \"$label\" is on screen at $cx,$cy")
+          foundLabel = label; foundRowX = cx; foundRowY = cy
+          foundSwitchX = (dump.optInt("w", 720) * 0.87).toInt(); foundSwitchY = cy
+          lastFoundAt = System.currentTimeMillis()
+          pendingLook = true
+          return JSONObject()
+            .put("ok", false)
+            .put("already_on_screen", label)
+            .put(
+              "error",
+              "\"$label\" is ON THIS SCREEN right now. Leaving to go and find it is wrong — you are looking at it."
+            )
+            .put(
+              "do_now",
+              "Act on it where it is: tap_found(\"switch\") to toggle it, or tap_found(\"row\") to open it. Do not " +
+                "open another app, do not go back, do not scroll looking for it."
+            )
+            .put("screen_now", screenBrief(dump))
+        }
         val wanted = args.optString("app")
         // Wandering guard. When she gets stuck she has been abandoning the task
         // and opening something unrelated - failing at a Google account, then
