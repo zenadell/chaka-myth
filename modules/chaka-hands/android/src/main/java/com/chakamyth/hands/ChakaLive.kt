@@ -2031,6 +2031,55 @@ class ChakaLive(
     return (y.contains(x) || x.contains(y)) && shorter.toDouble() / longer >= 0.75
   }
 
+  /**
+   * ONE permission check, for every way of touching a control.
+   *
+   * This logic lived inside tap_index and nowhere else, so five other paths —
+   * tap_at, tap_found, long_press_at, set_found_switch, open_found_target —
+   * could change any switch on the phone with nothing to stop them. She turned
+   * Developer options OFF through one of them, mid-task, unasked, and the owner
+   * had to re-enable it by hand. Guarding one door of six is not guarding.
+   *
+   * Returns a refusal, or null when this control is genuinely part of the task.
+   */
+  private fun changeBlocked(label: String): JSONObject? {
+    if (label.isBlank()) return null
+    val req = (currentRequest + " " + synchronized(recentSpeech) { recentSpeech.toString() }).lowercase()
+    val name = label.lowercase().trim()
+    val tokens = name.split(Regex("[^a-z0-9]+")).filter { it.isNotBlank() }
+    val mentioned = req.contains(name) || (tokens.isNotEmpty() && tokens.all { req.contains(it) })
+    val verbs = "turn on|turn off|turn|enable|disable|switch on|switch off|toggle|activate|deactivate|put on|put off|set"
+    val askedToChangeThis =
+      Regex("($verbs)\\W+(\\w+\\W+){0,2}?" + Regex.escape(name)).containsMatchIn(req) ||
+      Regex("($verbs)\\W+(\\w+\\W+){0,2}?" + Regex.escape(tokens.firstOrNull() ?: name)).containsMatchIn(req)
+
+    if (!mentioned) {
+      Log.w(TAG, "BLOCKED change to \"$label\" — never mentioned in \"$currentRequest\"")
+      return JSONObject().put("ok", false).put("off_task", true).put("the_request", currentRequest)
+        .put("error", "\"$label\" is not part of what was asked. Do not change settings nobody mentioned.")
+        .put("do_now", "Leave it alone and go back to the actual request.")
+    }
+    if (!askedToChangeThis) {
+      Log.w(TAG, "BLOCKED change to \"$label\" — mentioned, but not asked to change")
+      return JSONObject().put("ok", false).put("off_task", true).put("the_request", currentRequest)
+        .put("error", "\"$label\" was mentioned, but nobody asked you to CHANGE it. Reading it is not permission to touch it.")
+        .put("do_now", "Leave it exactly as it is. Report its state if that was the question, and move on.")
+    }
+    return null
+  }
+
+  /** The switch under a point, so a coordinate tap is checked like a named one. */
+  private fun toggleLabelAt(dump: JSONObject, x: Int, y: Int): String? {
+    val els = dump.optJSONArray("els") ?: return null
+    for (k in 0 until els.length()) {
+      val e = els.optJSONObject(k) ?: continue
+      if (!e.optBoolean("toggle")) continue
+      if (x < e.optInt("x1") || x > e.optInt("x2") || y < e.optInt("y1") || y > e.optInt("y2")) continue
+      return listOf(e.optString("text"), e.optString("desc")).filter { it.isNotBlank() }.joinToString(" ")
+    }
+    return null
+  }
+
   private fun planText(): String {
     if (plan.isEmpty()) return "(no plan set — call set_plan if this needs more than one step)"
     return "GOAL: $planGoal\n" + plan.mapIndexed { i, st ->
@@ -2758,6 +2807,7 @@ class ChakaLive(
         withOutcome(dump, "open_found_target:$target", res)
       }
       "set_found_switch" -> {
+        foundLabel.takeIf { it.isNotBlank() }?.let { l -> changeBlocked(l)?.let { return it } }
         if (!hasTargetLock()) {
           return JSONObject()
             .put("ok", false)
@@ -2805,6 +2855,7 @@ class ChakaLive(
       // picture that has already faded, while she fires the next swipe. The
       // element tree answers it exactly, every time, for free.
       "tap_found" -> {
+        foundLabel.takeIf { it.isNotBlank() }?.let { l -> changeBlocked(l)?.let { return it } }
         if (foundLabel.isBlank() || foundRowY < 0) {
           return JSONObject().put("ok", false)
             .put("error", "Nothing has been located yet. Call scroll_to first, then tap_found.")
@@ -3226,6 +3277,10 @@ class ChakaLive(
           )
         if (x < 0 || y < 0) JSONObject().put("ok", false).put("error", "x and y must be 0..1")
         else {
+          // A coordinate tap on a switch is still changing a setting. Without
+          // this, every guard could be walked round simply by tapping the
+          // pixels instead of naming the row.
+          toggleLabelAt(dump, x, y)?.let { l -> changeBlocked(l)?.let { return it } }
           // Round to a coarse grid: tapping 3px away is the same attempt.
           val gx = (args.optDouble("x") * 10).toInt(); val gy = (args.optDouble("y") * 10).toInt()
           loopGuard(dump, "tap_at:$gx,$gy")?.let { return it }
@@ -3242,7 +3297,10 @@ class ChakaLive(
             "x=$rx y=$ry are not valid coordinates. Use fractions 0..1, or exact pixels within ${w}x${h}."
           )
         if (x < 0 || y < 0) JSONObject().put("ok", false).put("error", "x and y must be 0..1")
-        else { service.swipe(x, y, x, y, 650); JSONObject().put("ok", true) }
+        else {
+          toggleLabelAt(dump, x, y)?.let { l -> changeBlocked(l)?.let { return it } }
+          service.swipe(x, y, x, y, 650); JSONObject().put("ok", true)
+        }
       }
       // Arbitrary two-point gesture — the only thing that can turn a picker
       // wheel, move a slider or drag a carousel. A whole-screen swipe scrolls
