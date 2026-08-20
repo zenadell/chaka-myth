@@ -83,6 +83,20 @@ check("vague 'turn on the debugging thing' -> no match, she must ask",
       named_target_on_screen("turn on the debugging thing"), None)
 
 
+print("\nF. THE REQUEST GROWS AS HE TALKS — the run where she never heard 'off'")
+# What currentRequest actually holds after his answers are folded in.
+GROWN = ("I need you to go turn on the debugging team. Give me the ones you see "
+         "then I will tell you the one to double on. of USB debugging Turn it off. "
+         "No, just turn off USB debugging, that's all.")
+check("tapping 'USB debugging' is ALLOWED once he has said it",
+  danger_blocked(["USB debugging"], GROWN), None)
+check("'Developer options' is STILL blocked with the grown request",
+  danger_blocked(["Developer options"], GROWN) is not None, True)
+check("'Revoke USB debugging authorisations' is STILL blocked",
+  danger_blocked(["Revoke USB debugging authorisations"], GROWN) is not None, True)
+check("with only the FIRST mistranscribed line, USB debugging was blocked — that was the bug",
+  danger_blocked(["Revoke USB debugging authorisations"], "I need you to go turn on the debugging team.") is not None, True)
+
 print("\nE. MISTRANSCRIBED REQUEST — the failure that made it go insane")
 e = row("USB debugging")
 # she searched for it by name; the transcript arrived corrupted as "bargain thing"

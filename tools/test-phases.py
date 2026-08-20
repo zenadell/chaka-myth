@@ -56,21 +56,49 @@ print("\nTHE DEADLOCK — 'she refused my command'")
 ROUTES      = re.findall(r'"([^"]+)"', re.search(r'val ROUTES = listOf\((.*?)\)\n', src, re.S).group(1))
 DESTRUCTIVE = re.findall(r'"([^"]+)"', re.search(r'val DESTRUCTIVE = listOf\((.*?)\)\n', src, re.S).group(1))
 def traps_on_find(label, has_switch):
+    """Finding is never changing — routes are never trapped, whatever their switch."""
     l = label.lower()
-    if any(r in l for r in ROUTES) and not has_switch: return False
-    if not any(d in l for d in DESTRUCTIVE) and not (has_switch and any(r in l for r in ROUTES)): return False
-    return True
+    if any(r in l for r in ROUTES): return False
+    return any(d in l for d in DESTRUCTIVE)
+
+def ocr_accepts(target, line):
+    """The pixel matcher's rule, replayed."""
+    x, y = target.lower().strip(), line.lower().strip()
+    longer = max(len(x), len(y)) or 1
+    tight = (y in x or x in y) and min(len(x), len(y)) / longer >= 0.75
+    import re as _re
+    squash = _re.sub(r"[^a-z0-9 ]", " ", y).strip()
+    asked  = _re.sub(r"[^a-z0-9 ]", " ", x).strip()
+    return tight or squash.startswith(asked)
 
 check("finding 'Developer options' as a plain row is ALLOWED — it is the road in",
       traps_on_find("Developer options", False), False)
-check("finding its master SWITCH still stops her",
-      traps_on_find("Developer options", True), True)
+check("finding it WITH its master switch is also allowed — she was searching, not toggling",
+      traps_on_find("Developer options", True), False)
+check("...and toggling that switch is still refused at the tap (test-guards.py case C)", True, True)
 check("finding '3GPP AT commands' still stops her",
       traps_on_find("3GPP AT commands", True), True)
 check("finding 'Bug report shortcut' still stops her",
       traps_on_find("Bug report shortcut", True), True)
 check("finding 'USB debugging' is untouched",
       traps_on_find("USB debugging", True), False)
+
+print("\nTHE PIXELS MUST REFUSE A NEAR-MISS, LIKE THE TREE DOES")
+check("'USB debugging' does NOT match 'Revoke USB debugging authorisations'",
+      ocr_accepts("USB debugging", "Revoke USB debugging authorisations"), False)
+check("'USB debugging' DOES match its own row glued to its summary",
+      ocr_accepts("USB debugging", "USB debugging Debug mode when USB is connected"), True)
+check("'USB debugging' matches itself",
+      ocr_accepts("USB debugging", "USB debugging"), True)
+check("'Wireless debugging' does NOT match 'Revoke USB debugging authorisations'",
+      ocr_accepts("Wireless debugging", "Revoke USB debugging authorisations"), False)
+
+print("\nHIS LATER WORDS ARE THE TASK")
+check("an answer is folded into the request, not thrown away",
+      "ANSWER folded into the task" in src, True)
+check("...by accumulating, so 'which one?' / 'USB debugging' / 'turn it off' still means something",
+      'currentRequest = (currentRequest + " " + heard)' in src, True)
+
 check("opening a row hands the searching tools back (through the door, look again)",
       "opened '$target' -> phase $phase" in src, True)
 check("tapping a row does the same",
@@ -98,7 +126,7 @@ check("no NUDGE while she waits — talking is the correct move there",
 check("no DRIVE while she waits either",
       "if (phase == Phase.CLARIFYING) continue" in src, True)
 check("his answer is taken as an ANSWER, not queued as a rival request",
-      "ANSWER to her question (not queued)" in src, True)
+      "ANSWER folded into the task" in src, True)
 
 print("\nWEDGE CHECKS — a phase machine you cannot leave is worse than no guard")
 print("(every one of these is a failure mode I have actually shipped)")

@@ -994,7 +994,19 @@ class ChakaLive(
             // branch filed it as a NEW request and had her ask whether to
             // abandon her own question. He answered her and she argued about it.
             lastActivityAt = now
-            Log.i(TAG, "ANSWER to her question (not queued): \"$heard\"")
+            // ...and his answer BECOMES part of the task. Not queued, but not
+            // discarded either — which is what I did an hour ago, and it is
+            // why she spent the whole run believing the job was still "turn ON
+            // the debugging team", the first mistranscribed sentence, while he
+            // said "turn off USB debugging" three separate times. Every guard
+            // that reads the request read that stale line: "refusing to toggle
+            // ... not part of 'I need you to go turn on the debugging team'".
+            //
+            // Answers accumulate, because that is how the conversation works:
+            // "which one?" / "USB debugging" / "turn it off" only means
+            // anything as a whole.
+            currentRequest = (currentRequest + " " + heard).trim().takeLast(300)
+            Log.i(TAG, "ANSWER folded into the task: \"$heard\" -> request now \"${currentRequest.takeLast(90)}\"")
           } else if (taskActive && currentRequest.isNotEmpty() && !isFollowUp(said) && words >= 5) {
             // Busy. Only stop/wait/cancel act immediately (handled above);
             // anything else is queued and confirmed, never applied silently.
@@ -2568,10 +2580,18 @@ class ChakaLive(
   private fun clarifyIfDangerous(label: String, hasSwitch: Boolean): JSONObject? {
     if (label.isBlank()) return null
     val l = label.lowercase()
-    // A route is a route whether or not she has a switch to flip on it. Walking
-    // in is allowed; the switch is still guarded at tap time by dangerBlocked.
-    if (ROUTES.any { l.contains(it) } && !hasSwitch) return null
-    if (DESTRUCTIVE.none { l.contains(it) } && !(hasSwitch && ROUTES.any { l.contains(it) })) return null
+    // FINDING IS NEVER CHANGING. I kept half of this rule and it cost you the
+    // whole run: inside Developer options the page's own master switch is a row
+    // called "Developer options" WITH a switch, so searching for a landmark
+    // there tripped the trap, and scroll_to and swipe both vanished. She told
+    // you she was in Developer options and could not find it. She was right —
+    // I had taken away scrolling and left her staring at the first screen.
+    //
+    // A route is never trapped on the find, switch or no switch. Toggling it
+    // off is still refused at the tap by dangerBlocked, which is where the
+    // damage would actually happen.
+    if (ROUTES.any { l.contains(it) }) return null
+    if (DESTRUCTIVE.none { l.contains(it) }) return null
     val danger = dangerBlocked(listOf(label)) ?: return null
     Log.w(TAG, "PHASE -> CLARIFYING — found dangerous '$label' that he never named")
     phase = Phase.CLARIFYING
@@ -3662,6 +3682,24 @@ class ChakaLive(
           runCatching { service.findByPixels(target, searchPkg) }.getOrNull()?.let { raw ->
             val o = JSONObject(raw)
             if (o.optBoolean("found")) {
+              // THE SAME CHECK THE TREE ALREADY DOES. The tree found "Revoke
+              // USB debugging authorisations" for "USB debugging", refused it
+              // as a loose match and handed over to the pixels — and the pixels
+              // then accepted the very same row, because OCR only asks whether
+              // every word of the query appears in the line. It does. Revoking
+              // your USB debugging authorisations is not USB debugging, and
+              // being on the denylist it then trapped her in CLARIFYING, twice.
+              //
+              // A row often arrives glued to its own summary ("USB debugging
+              // Debug mode when USB is connected"), which is still the right
+              // row — so a line that BEGINS with what she asked for counts.
+              val ocrText = o.optString("text")
+              val squashed = ocrText.lowercase().replace(Regex("[^a-z0-9 ]"), " ").trim()
+              val asked = target.lowercase().replace(Regex("[^a-z0-9 ]"), " ").trim()
+              if (!sameTargetish(target, ocrText) && !squashed.startsWith(asked)) {
+                Log.w(TAG, "scroll_to '$target' -> pixels matched '$ocrText', a different setting — keeping looking")
+                return@let null
+              }
               // Several things on screen answer to this name. Choosing one and
               // acting is how an assistant turns on the wrong thing with total
               // confidence — "the debugging thing" is USB debugging, Wireless
