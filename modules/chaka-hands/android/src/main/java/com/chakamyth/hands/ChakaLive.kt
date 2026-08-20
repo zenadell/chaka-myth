@@ -140,6 +140,9 @@ class ChakaLive(
   @Volatile private var halted = false
   @Volatile private var haltedAt = 0L
   @Volatile private var lastAudioOutAt = 0L
+  // How many times the room was mistaken for him. Counted so it is visible in
+  // the log rather than being a silent improvement nobody can check.
+  @Volatile private var phantomBargeIns = 0
   // A turn that was cut off isn't a turn she chose to end - pushing her to
   // "continue" after one just makes her act without having finished thinking.
   @Volatile private var interruptedThisTurn = false
@@ -936,9 +939,32 @@ class ChakaLive(
       // Barge-in: the user started talking over her, so drop whatever audio is
       // still queued and let them lead.
       if (content.optBoolean("interrupted", false)) {
+        // IS ANYONE ACTUALLY TALKING?
+        //
+        // The server's own voice detection scores any sound as a barge-in, and
+        // measured on the phone with nobody in the room it fired four times in
+        // four seconds — every turn cut off at about 0.2s, said="" each time.
+        // She never finished a thought, so she re-fired the same tool over and
+        // over. That is what "she wandered off" looks like from the inside.
+        //
+        // The second recogniser is the evidence, exactly as it is for a
+        // transcript: it reports only when real WORDS were recognised, so a
+        // fan, a market or a television never satisfies it. This is the owner's
+        // own design from his website assistant, applied to the one signal that
+        // was still bypassing it.
+        //
+        // Only a definite "no words" is ignored. Not knowing means honouring
+        // the interruption — being deaf to him is far worse than talking over
+        // a noise.
+        if (ears.heardHumanSpeech(4000) == false) {
+          phantomBargeIns++
+          if (phantomBargeIns <= 3 || phantomBargeIns % 25 == 0)
+            Log.w(TAG, "IGNORING phantom interruption #$phantomBargeIns — second ears heard no words in the room")
+          return@let
+        }
         runCatching { player?.pause(); player?.flush(); player?.play() }
         interruptedThisTurn = true
-        Log.i(TAG, "interrupted by user")
+        Log.i(TAG, "interrupted by user (ears: \"${ears.lastWords.take(30)}\")")
         return@let
       }
 
@@ -1703,12 +1729,27 @@ class ChakaLive(
     // Typed instructions used to bypass inputTranscription entirely, so the
     // native task/proof guards still described an older request. That made the
     // safety layer blind precisely when a user was using the text chat.
-    if (!isFollowUp(said.lowercase())) {
+    // The phase machine has to hear typed words exactly as it hears spoken
+    // ones, or the chat box talks to a session frozen in whatever state the
+    // last voice turn left it in — asked a question and waiting forever, or
+    // DONE and unable to start anything.
+    if (phase == Phase.CLARIFYING) {
+      Log.i(TAG, "PHASE CLARIFYING -> LOCATING (he typed an answer)")
+      phase = Phase.LOCATING
+      currentRequest = (currentRequest + " " + said).trim().takeLast(300)
+    } else if (!isFollowUp(said.lowercase())) {
       currentRequest = said
       clearSwitchProof()
       plan.clear(); planStep = 0; planGoal = ""
       stateActionCount.clear(); triedFromState.clear(); stateVisits.clear()
       noProgressRun = 0
+      phase = Phase.LOCATING
+      refusals.clear()
+      halted = false
+      Log.i(TAG, "PHASE -> LOCATING for typed request: \"$said\"")
+    } else {
+      currentRequest = (currentRequest + " " + said).trim().takeLast(300)
+      if (phase == Phase.DONE || phase == Phase.IDLE) phase = Phase.LOCATING
     }
     pendingUserWord = said
     synchronized(recentSpeech) {
@@ -2961,7 +3002,7 @@ class ChakaLive(
     // against on the first move of a brand-new request: she was told "turn on
     // the debugging thing", reached for Settings, and was stopped and told the
     // user had spoken — quoting the very instruction she was carrying out.
-    if (fresh.isNotEmpty() && fresh == currentRequest) {
+    if (fresh.isNotEmpty() && currentRequest.endsWith(fresh)) {
       pendingUserWord = ""
       Log.i(TAG, "not holding '$name' — this IS what he just asked for")
     }

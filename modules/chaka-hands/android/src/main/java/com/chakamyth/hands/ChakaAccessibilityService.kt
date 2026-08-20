@@ -904,9 +904,31 @@ class ChakaAccessibilityService : AccessibilityService() {
       .put("found", true)
       .put("text", hit.text)
       .apply {
-        if (all.size > 1) {
+        // AMBIGUOUS MEANS "I CANNOT TELL WHICH", NOT "MORE THAN ONE CONTAINS
+        // THESE WORDS".
+        //
+        // Asked for "USB debugging" on the Developer options page, this matched
+        // both "USB debugging" and "Revoke USB debugging authorisations" and
+        // refused — and since the proof guard will not let her report a switch
+        // she has not read, the two locked against each other. Measured on the
+        // phone: she turned USB debugging off correctly, pressed OK on the
+        // system dialog, and then spent the rest of the session alternating
+        // between two refusals, unable to say she had done it.
+        //
+        // When one line IS the thing she asked for, word for word, there is
+        // nothing to be confused about. Only genuine rivals stop her.
+        val asked = query.lowercase().replace(Regex("[^a-z0-9 ]"), " ").trim()
+        val rivals = all.filter { c ->
+          c.text.lowercase().replace(Regex("[^a-z0-9 ]"), " ").trim() != asked
+        }
+        val exact = all.size - rivals.size
+        if (exact == 0 && all.size > 1) {
           put("ambiguous", true)
           put("also_matched", org.json.JSONArray(all.map { it.text }))
+        } else if (all.size > 1) {
+          // Say what else was there, but do not stop for it.
+          put("also_matched", org.json.JSONArray(all.map { it.text }))
+          put("chose_exact_match", true)
         }
       }
       .put("cx", (hit.box.centerX() * sx).toInt())

@@ -83,6 +83,36 @@ check("finding 'Bug report shortcut' still stops her",
 check("finding 'USB debugging' is untouched",
       traps_on_find("USB debugging", True), False)
 
+print("\nSHE FINISHED THE JOB AND COULD NOT SAY SO")
+svc = open("modules/chaka-hands/android/src/main/java/com/chakamyth/hands/ChakaAccessibilityService.kt").read()
+def ambiguous(asked, lines):
+    """The pixel finder's rule, replayed: an exact match ends the confusion."""
+    import re as _re
+    a = _re.sub(r"[^a-z0-9 ]", " ", asked.lower()).strip()
+    hits = [l for l in lines if all(w in l.lower() for w in a.split())]
+    exact = [l for l in hits if _re.sub(r"[^a-z0-9 ]", " ", l.lower()).strip() == a]
+    return len(exact) == 0 and len(hits) > 1
+
+ROWS = ["USB debugging", "Revoke USB debugging authorisations", "Wireless debugging"]
+check("'USB debugging' is NOT ambiguous — one line is exactly that",
+      ambiguous("USB debugging", ROWS), False)
+check("'debugging' alone IS ambiguous — three rivals, no exact match",
+      ambiguous("debugging", ROWS), True)
+check("'Wireless debugging' is NOT ambiguous",
+      ambiguous("Wireless debugging", ROWS), False)
+check("the rule lives in the source, not only in this test",
+      "AMBIGUOUS MEANS \"I CANNOT TELL WHICH\"" in svc, True)
+
+print("\nTHE PHANTOM BARGE-IN — measured with nobody in the room")
+check("a barge-in must be backed by recognised WORDS, not just sound",
+      'ears.heardHumanSpeech(4000) == false' in src, True)
+check("not knowing still honours it — never be deaf to him",
+      "Only a definite \"no words\" is ignored" in src, True)
+check("phantoms are counted and logged, not silently swallowed",
+      "IGNORING phantom interruption" in src, True)
+check("his answer no longer trips the 'user spoke mid-task' hold",
+      "currentRequest.endsWith(fresh)" in src, True)
+
 print("\nSHE TURNED DEVELOPER OPTIONS OFF — how it got through")
 check("the denylist now needs a VERB aimed at it, not a mention",
       "askedToChange(hit, said)" in src, True)
