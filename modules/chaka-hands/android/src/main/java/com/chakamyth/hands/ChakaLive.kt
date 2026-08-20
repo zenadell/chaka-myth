@@ -1863,21 +1863,6 @@ class ChakaLive(
     return target.takeIf { it.split(Regex("\\s+")).any { word -> word.length > 2 } }
   }
 
-  private fun targetLockedResponse(action: String): JSONObject = JSONObject()
-    .put("ok", false)
-    .put("target_locked", lockedTarget)
-    .put(
-      "error",
-      "\"$lockedTarget\" has already been found exactly. $action is blocked because it could move past or act beside the target."
-    )
-    .put(
-      "do_now",
-      if (lockedTargetHasSwitch)
-        "Read the proven switch_is result, call set_found_switch only if the user asked to change it, then finish."
-      else
-        "Call open_found_target. It opens this exact row natively; do not tap by coordinates or scroll again."
-    )
-
   private fun isWirelessDebuggingStateCheck(request: String): Boolean {
     val normalized = request.lowercase().replace(Regex("[^a-z0-9]+"), "")
     return normalized.contains("wirelessdebugging") &&
@@ -2285,13 +2270,30 @@ class ChakaLive(
    * No escalation, no counter, no way to earn permission through persistence:
    * either the exact words are in what he said, or it does not happen.
    */
+  /**
+   * Places you WALK THROUGH on the way somewhere, which must never be toggled.
+   *
+   * Developer options is the door to USB debugging and Wireless debugging.
+   * There is no other way in. Turning it OFF cuts the phone off — that is what
+   * happened to you, and it is why it is on the list. But refusing to LOOK at
+   * it refuses the whole task: she found the door, I took her hands away, you
+   * spoke, she found the door again, and I took them away again. Round and
+   * round, and from where you sat she was simply refusing you.
+   *
+   * So the door may be opened. Only its switch is guarded.
+   */
+  private val ROUTES = listOf("developer option", "developer options")
+
+  /** Things where touching at all is the damage, whatever your intention. */
+  private val DESTRUCTIVE = listOf(
+    "3gpp", "at command", "oem unlock",
+    "factory reset", "erase all", "wipe", "revoke", "bug report", "restart", "reboot",
+    "sign out", "log out", "delete account", "remove account", "force stop", "uninstall"
+  )
+
   private fun dangerBlocked(labels: List<String>): JSONObject? {
     val said = (currentRequest + " " + synchronized(recentSpeech) { recentSpeech.toString() }).lowercase()
-    val deadly = listOf(
-      "developer option", "developer options", "3gpp", "at command", "oem unlock",
-      "factory reset", "erase all", "wipe", "revoke", "bug report", "restart", "reboot",
-      "sign out", "log out", "delete account", "remove account", "force stop", "uninstall"
-    )
+    val deadly = ROUTES + DESTRUCTIVE
     for (label in labels) {
       val l = label.lowercase()
       val hit = deadly.firstOrNull { l.contains(it) } ?: continue
@@ -2563,8 +2565,13 @@ class ChakaLive(
    * cannot tap it, cannot try it another way, and cannot go around it. The only
    * thing left is to ask him — which is what a person would do.
    */
-  private fun clarifyIfDangerous(label: String): JSONObject? {
+  private fun clarifyIfDangerous(label: String, hasSwitch: Boolean): JSONObject? {
     if (label.isBlank()) return null
+    val l = label.lowercase()
+    // A route is a route whether or not she has a switch to flip on it. Walking
+    // in is allowed; the switch is still guarded at tap time by dangerBlocked.
+    if (ROUTES.any { l.contains(it) } && !hasSwitch) return null
+    if (DESTRUCTIVE.none { l.contains(it) } && !(hasSwitch && ROUTES.any { l.contains(it) })) return null
     val danger = dangerBlocked(listOf(label)) ?: return null
     Log.w(TAG, "PHASE -> CLARIFYING — found dangerous '$label' that he never named")
     phase = Phase.CLARIFYING
@@ -2905,7 +2912,15 @@ class ChakaLive(
     // The user has just said something and she is about to act on the old
     // intention. Make her read it first — one interruption per utterance.
     val fresh = pendingUserWord
-    if (fresh.isNotEmpty() && name !in setOf("read_screen", "look_at_screen", "read_clipboard")) {
+    // ...unless those words ARE the task. There is no old intention to guard
+    // against on the first move of a brand-new request: she was told "turn on
+    // the debugging thing", reached for Settings, and was stopped and told the
+    // user had spoken — quoting the very instruction she was carrying out.
+    if (fresh.isNotEmpty() && fresh == currentRequest) {
+      pendingUserWord = ""
+      Log.i(TAG, "not holding '$name' — this IS what he just asked for")
+    }
+    if (pendingUserWord.isNotEmpty() && name !in setOf("read_screen", "look_at_screen", "read_clipboard")) {
       pendingUserWord = ""
       Log.i(TAG, "holding '$name' — user just said: \"${fresh.take(60)}\"")
       return JSONObject()
@@ -2970,30 +2985,13 @@ class ChakaLive(
     // the blind tap we are trying to make impossible.
     if (name in TOUCHES_THE_PHONE) ensureSeen(dump)
 
-    // Finding a target is a state transition, not a hint for the model to
-    // maybe remember. Once found, only native exact-target operations may
-    // follow. This prevents the observed down-to-the-end, up-to-the-top loop.
-    if (hasTargetLock()) {
-      val sameLockedSearch = name == "scroll_to" && sameTarget(args.optString("target"), lockedTarget)
-      // MOVING AND LOOKING ARE ALWAYS ALLOWED. The lock exists to stop her
-      // ACTING on the wrong control, not to pin her to one spot. It listed only
-      // reading and acting, so once it engaged she could not swipe at all —
-      // she tried four times, was refused four times, and told the owner "I'm
-      // stuck on the first screen, I can't scroll down". She was right, and it
-      // was this. Locking a target and then forbidding movement is incoherent:
-      // scrolling is how you reach the thing you are locked onto.
-      val navigating = name in setOf(
-        "swipe", "scroll_to", "press_button", "open_app_drawer", "wait",
-        "read_screen", "look_at_screen", "read_clipboard", "task_done", "remember", "recall"
-      )
-      val allowed = navigating ||
-        name in setOf("open_found_target", "set_found_switch", "tap_found") ||
-        sameLockedSearch
-      if (!allowed) {
-        pendingLook = true
-        return targetLockedResponse(name).put("screen_now", screenBrief(dump))
-      }
-    }
+    // The target lock used to refuse tools here. The phase machine owns that
+    // now, and the two disagreed in front of you: the gate had put her in
+    // LOCATING and this told her "\"Developer options\" has already been found,
+    // tap_index is blocked — call open_found_target", which the gate then also
+    // refused. Two mechanisms, opposite instructions, and she was stuck between
+    // them. The lock still remembers WHERE the target is; it no longer argues
+    // about what she may do.
 
     // A named setting-state request must start with the deterministic locator,
     // never with vision-guided swipes. Without this gate the model can ignore
@@ -3382,6 +3380,12 @@ class ChakaLive(
         huntFor = ""; huntSwipes = 0; huntReversals = 0; huntDir = ""
         val isStateTarget = settingStateTarget(currentRequest)?.let { sameTarget(it, target) } == true
         if (!isStateTarget) clearTargetLock()
+        // You opened a door. What you were looking for is not this door — it is
+        // whatever is behind it, and you have not found that yet. Without this,
+        // READY kept insisting "it is in front of you" about the row she had
+        // just walked through, and refused her the search for what came next.
+        if (!isStateTarget) { phase = Phase.LOCATING; foundLabel = "" }
+        Log.i(TAG, "opened '$target' -> phase $phase")
         withOutcome(dump, "open_found_target:$target", res)
       }
       "set_found_switch" -> {
@@ -3494,9 +3498,17 @@ class ChakaLive(
               .put("screen_now", screenBrief(dump))
           }
         }
+        val tappedLabel = foundLabel
+        if (!wantSwitch) {
+          // Tapping a ROW opens it. Same as open_found_target: she is through
+          // the door and looking again.
+          Log.i(TAG, "tapped row '$tappedLabel' open -> phase LOCATING")
+          phase = Phase.LOCATING
+          foundLabel = ""
+        }
         withOutcome(
-          dump, "tap_found:${if (wantSwitch) "switch" else "row"}:$foundLabel",
-          JSONObject().put("ok", true).put("tapped", foundLabel).put("at", "$x,$y")
+          dump, "tap_found:${if (wantSwitch) "switch" else "row"}:$tappedLabel",
+          JSONObject().put("ok", true).put("tapped", tappedLabel).put("at", "$x,$y")
         )
       }
       "scroll_to" -> {
@@ -3594,7 +3606,7 @@ class ChakaLive(
             pendingLook = true
             huntFor = ""; huntSwipes = 0; huntReversals = 0; huntDir = ""
             lockTarget(target, n.has("switch_is"))
-            clarifyIfDangerous(n.optString("label"))?.let { return it }
+            clarifyIfDangerous(n.optString("label"), n.has("switch_is"))?.let { return it }
             foundLabel = n.optString("label"); lastFoundAt = System.currentTimeMillis()
             phase = Phase.READY
             pendingDecision =
@@ -3682,7 +3694,7 @@ class ChakaLive(
               // the right-hand edge. Tapping the words opens the setting's own
               // page; tapping the switch toggles it.
               val w = dump.optInt("w", 720)
-              clarifyIfDangerous(o.optString("text"))?.let { return it }
+              clarifyIfDangerous(o.optString("text"), false)?.let { return it }
               foundLabel = o.optString("text"); lastFoundAt = System.currentTimeMillis()
               phase = Phase.READY
               pendingDecision =

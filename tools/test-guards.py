@@ -3,8 +3,11 @@ SRC = "modules/chaka-hands/android/src/main/java/com/chakamyth/hands/ChakaLive.k
 src = open(SRC).read()
 
 # --- constants pulled FROM THE SOURCE, not retyped, so this cannot drift ---
-m = re.search(r'val deadly = listOf\((.*?)\)\n', src, re.S)
-DEADLY = re.findall(r'"([^"]+)"', m.group(1))
+# The list now has two halves, because walking into Developer options and
+# turning it off are not the same act. dangerBlocked still uses both.
+ROUTES      = re.findall(r'"([^"]+)"', re.search(r'val ROUTES = listOf\((.*?)\)\n', src, re.S).group(1))
+DESTRUCTIVE = re.findall(r'"([^"]+)"', re.search(r'val DESTRUCTIVE = listOf\((.*?)\)\n', src, re.S).group(1))
+DEADLY = ROUTES + DESTRUCTIVE
 assert DEADLY, "could not read the denylist from source"
 
 # --- the real screen, straight off the phone ---

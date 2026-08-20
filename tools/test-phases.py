@@ -51,6 +51,35 @@ check("she may NOT toggle verbose logging", allowed("DONE","tap_index"), False)
 check("she may report and finish",          allowed("DONE","task_done"), True)
 
 
+print("\nTHE DEADLOCK — 'she refused my command'")
+# Replays clarifyIfDangerous's actual rule, read out of the source.
+ROUTES      = re.findall(r'"([^"]+)"', re.search(r'val ROUTES = listOf\((.*?)\)\n', src, re.S).group(1))
+DESTRUCTIVE = re.findall(r'"([^"]+)"', re.search(r'val DESTRUCTIVE = listOf\((.*?)\)\n', src, re.S).group(1))
+def traps_on_find(label, has_switch):
+    l = label.lower()
+    if any(r in l for r in ROUTES) and not has_switch: return False
+    if not any(d in l for d in DESTRUCTIVE) and not (has_switch and any(r in l for r in ROUTES)): return False
+    return True
+
+check("finding 'Developer options' as a plain row is ALLOWED — it is the road in",
+      traps_on_find("Developer options", False), False)
+check("finding its master SWITCH still stops her",
+      traps_on_find("Developer options", True), True)
+check("finding '3GPP AT commands' still stops her",
+      traps_on_find("3GPP AT commands", True), True)
+check("finding 'Bug report shortcut' still stops her",
+      traps_on_find("Bug report shortcut", True), True)
+check("finding 'USB debugging' is untouched",
+      traps_on_find("USB debugging", True), False)
+check("opening a row hands the searching tools back (through the door, look again)",
+      "opened '$target' -> phase $phase" in src, True)
+check("tapping a row does the same",
+      "tapped row '$tappedLabel' open -> phase LOCATING" in src, True)
+check("the target lock no longer argues with the gate",
+      "targetLockedResponse" not in src, True)
+check("she is not held on the first move of a request she was just given",
+      "this IS what he just asked for" in src, True)
+
 print("\nTHE WEDGE YOU JUST HIT — 'Allow USB debugging?' with no way to press OK")
 check("confirm_dialog exists in EVERY phase, including READY and DONE",
       all(allowed(p_, "confirm_dialog") for p_ in tools), True)
