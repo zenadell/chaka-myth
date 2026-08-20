@@ -24,12 +24,19 @@ for node in ET.parse(sys.argv[1]).getroot().iter("node"):
 def labels_at(x,y):
     return [e["label"] for e in els if e["x1"]<=x<=e["x2"] and e["y1"]<=y<=e["y2"]]
 
+VERBS = ("turn on|turn off|turn|enable|disable|switch on|switch off|toggle|"
+         "activate|deactivate|put on|put off|set|open|go to|go into")
+
+def asked_to_change(name, said):
+    """The source's rule: a change verb aimed at the name, not a bare mention."""
+    return re.search(r"(%s)\W+(\w+\W+){0,2}?%s" % (VERBS, re.escape(name)), said) is not None
+
 def danger_blocked(labels, said):
     said = said.lower()
     for lab in labels:
         l = lab.lower()
         for d in DEADLY:
-            if d in l and d not in said: return lab
+            if d in l and not asked_to_change(d, said): return lab
     return None
 
 def named_target_on_screen(said):
@@ -82,6 +89,21 @@ check("'open whatsapp and message my mum' -> travel allowed", named_target_on_sc
 check("vague 'turn on the debugging thing' -> no match, she must ask",
       named_target_on_screen("turn on the debugging thing"), None)
 
+
+print("\nG. TALKING ABOUT HER IS NOT TALKING TO HER")
+# Verbatim from the log, seconds before she tapped the master switch.
+REPORTING = ("i need you to go turn on the debugging team. and now she is in front of "
+             "developer option first screen. and doing nothing so i don't know. please check.")
+check("him REPORTING the fault does not unlock Developer options",
+      danger_blocked(["Developer options"], REPORTING) is not None, True)
+check("him asking about it does not unlock it either",
+      danger_blocked(["Developer options"], "is developer options on or off?") is not None, True)
+check("but 'turn off developer options' still does — his phone, his call",
+      danger_blocked(["Developer options"], "turn off developer options"), None)
+check("and 'go into developer options' lets her walk in",
+      danger_blocked(["Developer options"], "go into developer options"), None)
+check("saying '3gpp' in passing does not unlock 3GPP AT commands",
+      danger_blocked(["3GPP AT commands"], "why did she go near 3gpp at commands?") is not None, True)
 
 print("\nF. THE REQUEST GROWS AS HE TALKS — the run where she never heard 'off'")
 # What currentRequest actually holds after his answers are folded in.

@@ -83,6 +83,20 @@ check("finding 'Bug report shortcut' still stops her",
 check("finding 'USB debugging' is untouched",
       traps_on_find("USB debugging", True), False)
 
+print("\nSHE TURNED DEVELOPER OPTIONS OFF — how it got through")
+check("the denylist now needs a VERB aimed at it, not a mention",
+      "askedToChange(hit, said)" in src, True)
+check("...and that rule is shared with the off-task guard, so they cannot drift",
+      "private fun askedToChange(" in src, True)
+check("a row carrying a switch is read back after ANY tap, not only a toggle",
+      "val readBack = wantSwitch || foundSwitchX >= 0" in src, True)
+check("a page opening is not mistaken for a change (would toggle Wi-Fi to open Wi-Fi)",
+      "nowIs == wasIs" in src, True)
+check("an unintended toggle is shouted, not swallowed",
+      "TOGGLED it: $wasIs -> $nowIs" in src, True)
+check("the aim is NOT moved — tapping a row still taps the row",
+      "val x = if (wantSwitch && foundSwitchX >= 0) foundSwitchX else foundRowX" in src, True)
+
 print("\nTHE PIXELS MUST REFUSE A NEAR-MISS, LIKE THE TREE DOES")
 check("'USB debugging' does NOT match 'Revoke USB debugging authorisations'",
       ocr_accepts("USB debugging", "Revoke USB debugging authorisations"), False)

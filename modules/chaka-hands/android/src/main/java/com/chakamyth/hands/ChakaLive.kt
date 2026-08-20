@@ -2303,13 +2303,38 @@ class ChakaLive(
     "sign out", "log out", "delete account", "remove account", "force stop", "uninstall"
   )
 
+  /**
+   * Did he actually tell her to CHANGE this thing, as opposed to mentioning it?
+   *
+   * A change verb within a couple of words of the name. Describing a setting,
+   * asking about it, or complaining about it is not an instruction to touch it.
+   */
+  private fun askedToChange(name: String, said: String): Boolean {
+    val verbs = "turn on|turn off|turn|enable|disable|switch on|switch off|toggle|activate|deactivate|put on|put off|set|open|go to|go into"
+    return Regex("($verbs)\\W+(\\w+\\W+){0,2}?" + Regex.escape(name)).containsMatchIn(said)
+  }
+
   private fun dangerBlocked(labels: List<String>): JSONObject? {
     val said = (currentRequest + " " + synchronized(recentSpeech) { recentSpeech.toString() }).lowercase()
     val deadly = ROUTES + DESTRUCTIVE
     for (label in labels) {
       val l = label.lowercase()
       val hit = deadly.firstOrNull { l.contains(it) } ?: continue
-      if (said.contains(hit)) continue   // he named it himself — his phone, his call
+      // HIS PHONE, HIS CALL — but he has to be TELLING HER TO CHANGE IT.
+      //
+      // This used to stand down on any mention at all, and that is how
+      // Developer options got turned off. He was talking to ME about her:
+      //
+      //   "And now she is in front of developer option first screen and
+      //    doing nothing, so I don't know. Please check."
+      //
+      // She heard "developer option", the denylist read it as permission, and
+      // two minutes later she tapped its master switch. He was reporting a
+      // fault and it was taken as an order.
+      //
+      // A destructive control now needs a verb aimed at it: "turn off
+      // developer options", not the words appearing somewhere in the room.
+      if (askedToChange(hit, said)) continue
       Log.w(TAG, "DANGEROUS BLOCKED: \"$label\" (matched '$hit') — not named in what he asked")
       return JSONObject()
         .put("ok", false)
@@ -3467,7 +3492,27 @@ class ChakaLive(
         val wantSwitch = args.optString("part", "row").startsWith("s")
         val x = if (wantSwitch && foundSwitchX >= 0) foundSwitchX else foundRowX
         val y = if (wantSwitch && foundSwitchY >= 0) foundSwitchY else foundRowY
-        Log.i(TAG, "tap_found ${if (wantSwitch) "switch" else "row"} of '$foundLabel' at $x,$y")
+        // "row" means "open its page" — but on some rows there is no page and
+        // the whole row is the control, so tapping it toggles. That is exactly
+        // what happened to Developer options: she called tap_found("row")
+        // meaning to open it, and turned the whole thing off.
+        //
+        // The aim is NOT changed — moving it would toggle Wi-Fi when she meant
+        // to open Wi-Fi's settings, which is the same mistake facing the other
+        // way. What changes is that a row carrying a switch is always READ BACK
+        // afterwards. A toggle can then be seen and said out loud instead of
+        // happening silently, which is how this one went unnoticed until you
+        // saw the phone disconnect.
+        val readBack = wantSwitch || foundSwitchX >= 0
+        // What the switch reads BEFORE, so afterwards we can tell a toggle from
+        // a page opening. Without this, tapping the Wi-Fi row to open its page
+        // would read a switch on the next screen and be declared a completed
+        // change — the same mistake pointing the other way.
+        val wasIs = if (readBack) {
+          runCatching { service.findByText(foundLabel) }.getOrNull()
+            ?.let { runCatching { JSONObject(it) }.getOrNull() }?.optString("switch_is").orEmpty()
+        } else ""
+        Log.i(TAG, "tap_found ${if (wantSwitch) "switch" else "row"} of '$foundLabel' at $x,$y (was ${wasIs.ifBlank { "?" }})")
         service.tap(x, y)
 
         // READ THE SWITCH BACK. She turned USB debugging ON correctly, could not
@@ -3478,11 +3523,32 @@ class ChakaLive(
         //
         // The state is a fact on the control. Reading it costs nothing and ends
         // the doubt that makes her repeat a completed action.
-        if (wantSwitch) {
+        if (readBack) {
           Thread.sleep(600)
           val after = runCatching { service.findByText(foundLabel) }.getOrNull()
             ?.let { runCatching { JSONObject(it) }.getOrNull() }
           val nowIs = after?.optString("switch_is").orEmpty()
+          // A page opening is not a change. Only a state that actually MOVED
+          // closes the job; anything else is reported and she carries on.
+          if (nowIs.isNotBlank() && !wantSwitch && nowIs == wasIs) {
+            Log.i(TAG, "tap_found row of '$foundLabel': switch still $nowIs — this opened a page, nothing changed")
+            pendingLook = true
+            phase = Phase.LOCATING
+            foundLabel = ""
+            return JSONObject()
+              .put("ok", true)
+              .put("tapped", foundLabel)
+              .put("switch_unchanged", nowIs)
+              .put("note", "That opened it — the switch is still $nowIs, nothing was changed. Look for what you need on this screen.")
+              .put("screen_now", screenBrief(runCatching { JSONObject(service.dumpScreen()) }.getOrNull() ?: dump))
+          }
+          if (nowIs.isNotBlank() && !wantSwitch && nowIs != wasIs) {
+            // She asked to open it and it TOGGLED. Say so plainly — this is the
+            // one that turned Developer options off while she thought she was
+            // walking through a door, and nobody found out until the phone
+            // dropped off the network.
+            Log.w(TAG, "tap_found row of '$foundLabel' TOGGLED it: $wasIs -> $nowIs")
+          }
           if (nowIs.isNotBlank()) {
             Log.i(TAG, "tap_found: '$foundLabel' is now $nowIs — task closed")
             // THE JOB IS DONE, SO THE JOB ENDS. Every disaster tonight grew from
